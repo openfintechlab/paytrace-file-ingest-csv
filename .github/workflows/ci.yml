@@ -1,0 +1,1 @@
+# TODO! Write a CI workflow for this project. This should include steps to build the project, run tests, and perform any necessary linting or code quality checks. Consider using GitHub Actions for this purpose, and ensure that the workflow is triggered on appropriate events such as pushes to the main branch or pull requests.sss
