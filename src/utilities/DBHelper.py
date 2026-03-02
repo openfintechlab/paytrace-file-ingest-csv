@@ -17,8 +17,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
-from utilities.ConfigLoader import ConfigLoader
-from utilities.Logging import Logging
+from .ConfigLoader import ConfigLoader
+from .Logging import Logging
 
 
 class DBHelper:
