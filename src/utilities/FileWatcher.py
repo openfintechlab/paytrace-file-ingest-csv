@@ -63,6 +63,7 @@ class FileWatcherAgent:
 
     async def run_forever(self) -> None:
         self._bootstrap_directories()
+        # TODO! Remove automic tables creation. Table structure should be managed by DBAs having root access. 
         self._bootstrap_db_tables()
 
         Logging.info("File watcher root directory: %s", self.root_dir)
@@ -130,8 +131,13 @@ class FileWatcherAgent:
 
         async for changes in awatch(str(self.inbox_dir), recursive=True):
             for change, path_str in changes:
-                if Change is not None and change not in {Change.added, Change.modified, Change.moved}:
-                    continue
+                if Change is not None:
+                    allowed_changes = {Change.added, Change.modified}
+                    moved_change = getattr(Change, "moved", None)
+                    if moved_change is not None:
+                        allowed_changes.add(moved_change)
+                    if change not in allowed_changes:
+                        continue
                 if self._is_csv_path(path_str):
                     await self._enqueue_candidate(path_str)
 
@@ -339,7 +345,10 @@ class FileWatcherAgent:
             reader = csv.reader(handle)
             for row in reader:
                 row_number += 1
-                if row_number <= resume_row:
+                # [MFB-20260303]: Added header row skip and resume capability.
+                if row_number <= resume_row or row_number == 1:
+                    if row_number == 1:
+                        Logging.info("Skipping header row for %s", file_path)
                     continue
 
                 self._process_csv_row(row, row_number, file_path)
@@ -351,7 +360,7 @@ class FileWatcherAgent:
 
     def _process_csv_row(self, row: list[str], row_number: int, file_path: Path) -> None:
         _ = (row, row_number, file_path)
-        # Integration point for business logic (transform, validate, persist, publish).
+        #TODO! Integration point for business logic (transform, validate, persist, publish).
 
     @staticmethod
     def _compute_sha256_streaming(file_path: Path) -> str:
