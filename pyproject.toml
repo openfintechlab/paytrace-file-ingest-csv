@@ -6,5 +6,6 @@ dependencies = [
   "environs",
   "sqlalchemy",
   "psycopg2-binary",
-  "pytest"
+  "pytest",
+  "watchfiles>=1.1.1",
 ]
