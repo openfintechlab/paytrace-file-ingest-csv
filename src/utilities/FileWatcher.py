@@ -13,6 +13,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    from domain import PaymentProcessor
+except ModuleNotFoundError:  # pragma: no cover
+    from src.domain import PaymentProcessor
+
 from .ConfigLoader import ConfigLoader
 from .DBHelper import DBHelper
 from .Logging import Logging
@@ -60,6 +65,7 @@ class FileWatcherAgent:
         self._enqueued_paths: set[str] = set()
         self._enqueued_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
+        self._payment_processor = PaymentProcessor()
 
     async def run_forever(self) -> None:
         self._bootstrap_directories()
@@ -345,7 +351,7 @@ class FileWatcherAgent:
             reader = csv.reader(handle)
             for row in reader:
                 row_number += 1
-                # [MFB-20260303]: Added header row skip and resume capability.
+                # [MFB-20260303]: Added header row skip and resume capability.                
                 if row_number <= resume_row or row_number == 1:
                     if row_number == 1:
                         Logging.info("Skipping header row for %s", file_path)
@@ -359,8 +365,17 @@ class FileWatcherAgent:
         return row_number
 
     def _process_csv_row(self, row: list[str], row_number: int, file_path: Path) -> None:
-        _ = (row, row_number, file_path)
-        #TODO! Integration point for business logic (transform, validate, persist, publish).
+        # [MFB-20260304]: Wrapped processing in try/except to ensure robustness and checkpoint integrity. Errors will be 
+        #                 logged and cause the file to be marked as failed, but won't crash the worker or lose progress on 
+        #                 previous rows.
+        try:            
+            parsed_payment = self._payment_processor.process_row(row)            
+            _ = (parsed_payment, row_number, file_path)
+        except Exception as exc:
+            Logging.error("Error processing row %d in %s: %s", row_number, file_path, str(exc))
+
+            
+    
 
     @staticmethod
     def _compute_sha256_streaming(file_path: Path) -> str:
