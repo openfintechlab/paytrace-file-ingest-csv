@@ -69,8 +69,9 @@ class FileWatcherAgent:
 
     async def run_forever(self) -> None:
         self._bootstrap_directories()
-        # TODO! Remove automic tables creation. Table structure should be managed by DBAs having root access. 
-        self._bootstrap_db_tables()
+        # [MFB-20260306]: Removing the feature of creating the database objects as this will cause issue since in production environment
+        # the database user will not have permission to create tables. The expectation is that the DBA will run the provided SQL Scrpts
+        # self._bootstrap_db_tables()
 
         Logging.info("File watcher root directory: %s", self.root_dir)
         Logging.info("watchfiles available: %s", WATCHFILES_AVAILABLE)

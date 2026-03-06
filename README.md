@@ -189,6 +189,29 @@ PTX-0000001,DOMESTIC,2026-03-03T10:15:30Z,2026-03-04,2500.00,AED,SUPP,SHAR,,Shar
 PTX-0000002,CROSS_BORDER,2026-03-03T10:20:00Z,2026-03-04,1200.00,USD,INVC,SHAR,3.6725,Sharjah Trading LLC,AE,IBAN,AE070331234567890123456,BIC,SIBUAEAD,Global Parts Ltd,GB,IBAN,GB33BUKB20201555555555,BIC,BUKBGB22,DEUTDEFF,Invoice 9912 - spare parts,INV-9912
 ```
 
+### Table Structure
+
+``` sql
+ CREATE TABLE IF NOT EXISTS oftl_fwcsv_registry (
+                file_id VARCHAR(128) PRIMARY KEY,
+                filename TEXT NOT NULL,
+                file_size BIGINT NOT NULL,
+                mtime_ns BIGINT NOT NULL,
+                checksum_sha256 VARCHAR(64),
+                status VARCHAR(32) NOT NULL,
+                row_count BIGINT NOT NULL DEFAULT 0,
+                error_message TEXT,
+                started_at TIMESTAMPTZ,
+                ended_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+  CREATE TABLE IF NOT EXISTS oftl_fwcsv_checkpoint (
+      file_id VARCHAR(128) PRIMARY KEY,
+      row_number BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )
+```
+
 ## Major Libraries Used
 
 - `environs`
