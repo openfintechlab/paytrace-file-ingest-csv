@@ -21,7 +21,7 @@ except ModuleNotFoundError:  # pragma: no cover
 from .ConfigLoader import ConfigLoader
 from .DBHelper import DBHelper
 from .Logging import Logging
-
+from .RabbitMQHelper import RabbitMQHelper
 try:
     from watchfiles import Change, awatch
 
@@ -370,6 +370,8 @@ class FileWatcherAgent:
         #                 previous rows.
         try:            
             parsed_payment = self._payment_processor.process_row(row)            
+            RabbitMQHelper.send_p2p_message("TEST.QUEUE", parsed_payment)
+
             _ = (parsed_payment, row_number, file_path)
         except Exception as exc:
             Logging.error("Error processing row %d in %s: %s", row_number, file_path, str(exc))

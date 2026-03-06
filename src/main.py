@@ -12,10 +12,12 @@ try:
     from utilities.ConfigLoader import ConfigLoader
     from utilities.FileWatcher import FileWatcherAgent
     from utilities.Logging import Logging
+    from utilities.RabbitMQHelper import RabbitMQHelper
 except ModuleNotFoundError:
     from src.utilities.ConfigLoader import ConfigLoader
     from src.utilities.FileWatcher import FileWatcherAgent
     from src.utilities.Logging import Logging
+    from src.utilities.RabbitMQHelper import RabbitMQHelper
 
 _DEFAULT_LOG_LEVEL = "INFO"
 _DEFAULT_ROOT_DIR = "./fwcsv"
@@ -33,6 +35,8 @@ def display_banner() -> None:
 
 
 async def _run() -> None:
+    RabbitMQHelper.initialize_connection()
+    Logging.info("RabbitMQ startup connection established.")
     agent = FileWatcherAgent()
     await agent.run_forever()
 

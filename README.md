@@ -23,6 +23,7 @@ src/
     Logging.py             # Logging bootstrap and helper methods
     DBHelper.py            # Singleton DB engine/session helper + CRUD execution helpers
     FileWatcher.py         # CSV watcher/scanner and processing pipeline
+    RabbitMQHelper.py      # RabbitMQ queue/exchange messaging helper
 tests/
   test_config_loader.py    # Unit tests for ConfigLoader
   test_routes.py           # Legacy test file (references FastAPI app not present in current src/main.py)
@@ -103,6 +104,24 @@ uv run python src/main.py
 - `OFTL_FWCSV_CHECKPOINT_EVERY_ROWS` (default: `1000`)
 - `OFTL_FWCSV_FILE_ENCODING` (default: `utf-8`)
 
+### RabbitMQ
+
+- `OFTL_RABITMQ_HOST` (default: `localhost`)
+- `OFTL_RABITMQ_PORT` (default: `5672`)
+- `OFTL_RABITMQ_USERNAME` (default: `guest`)
+- `OFTL_RABITMQ_PASSWORD_SECRET` (default: `guest`)
+- `OFTL_RABITMQ_VHOST` (default: `/`)
+- `OFTL_RABITMQ_HEARTBEAT` (default: `60`)
+- `OFTL_RABITMQ_BLOCKED_CONNECTION_TIMEOUT` (default: `30`)
+- `OFTL_RABITMQ_CONNECTION_ATTEMPTS` (default: `3`)
+- `OFTL_RABITMQ_RETRY_DELAY` (default: `2`)
+- `OFTL_RABITMQ_SOCKET_TIMEOUT` (default: `5`)
+- `OFTL_RABITMQ_QUEUE_DURABLE` (default: `true`)
+- `OFTL_RABITMQ_EXCHANGE_DURABLE` (default: `true`)
+- `OFTL_RABITMQ_EXCHANGE_TYPE` (default: `direct`)
+- `OFTL_RABITMQ_MESSAGE_PERSISTENT` (default: `true`)
+- `OFTL_RABITMQ_PUBLISH_MANDATORY` (default: `false`)
+
 ## Database Objects
 
 On startup, the service currently auto-creates:
@@ -176,4 +195,5 @@ PTX-0000002,CROSS_BORDER,2026-03-03T10:20:00Z,2026-03-04,1200.00,USD,INVC,SHAR,3
 - `sqlalchemy`
 - `psycopg2-binary`
 - `watchfiles`
+- `pika`
 - `pytest`
