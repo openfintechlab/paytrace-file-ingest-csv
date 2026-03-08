@@ -88,7 +88,8 @@ uv run python src/main.py
 - `OFTL_POSTGRESDB_PASSWORD`
 - `OFTL_POSTGRESDB_HOST`
 - `OFTL_POSTGRESDB_PORT`
-- `OFTL_POSTGRESDB_NAME`
+- `OFTL_POSTGRESDB_NAME` (optional, default: `public`)
+- `OFTL_POSTGRESDB_SCHEMA` (optional, default: `public`)
 - `OFTL_POSTGRESDB_POOLSIZE` (optional, default: `10`)
 
 ### File Watcher (CSV Ingest)
@@ -140,7 +141,7 @@ On startup, the service currently auto-creates:
 - `execute_update(query, params=None)`
 - `execute_delete(query, params=None)`
 
-The helper validates required DB environment variables and performs a connectivity check (`SELECT 1`) during initialization.
+The helper validates required DB environment variables, defaults `OFTL_POSTGRESDB_NAME` and `OFTL_POSTGRESDB_SCHEMA` to `public`, sets the PostgreSQL `search_path` from `OFTL_POSTGRESDB_SCHEMA`, and performs a connectivity check (`SELECT 1`) during initialization.
 
 ## Testing
 
