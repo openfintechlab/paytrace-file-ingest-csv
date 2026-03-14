@@ -351,27 +351,41 @@ class FileWatcherAgent:
         Logging.info("Starting processing file: %s", file_path)
         with file_path.open("r", encoding=self.file_encoding, newline="") as handle:
             reader = csv.reader(handle)
+            header: list[str] | None = None
             for row in reader:
                 row_number += 1
                 # [MFB-20260303]: Added header row skip and resume capability.                
-                if row_number <= resume_row or row_number == 1:
-                    if row_number == 1:
-                        Logging.info("Skipping header row for %s", file_path)
+                if row_number == 1:
+                    header = [column.strip() for column in row]
+                    Logging.info("Skipping header row for %s", file_path)
                     continue
-                self._process_csv_row(row, row_number, file_path)
+
+                if row_number <= resume_row:
+                    continue
+
+                row_payload: list[str] | dict[str, str] = row
+                if header is not None:
+                    if len(row) != len(header):
+                        raise ValueError(
+                            f"CSV row has {len(row)} fields but header defines {len(header)} columns"
+                        )
+                    row_payload = dict(zip(header, row))
+
+                self._process_csv_row(row_payload, row_number, file_path)
                 if row_number % self.checkpoint_every_rows == 0:
                     self._checkpoint_upsert(file_id, row_number)
                 
         Logging.info("Completed processing file: %s, total rows: %d", file_path, row_number)
         return row_number
 
-    def _process_csv_row(self, row: list[str], row_number: int, file_path: Path) -> None:
+    def _process_csv_row(self, row: list[str] | dict[str, str], row_number: int, file_path: Path) -> None:
         # [MFB-20260304]: Wrapped processing in try/except to ensure robustness and checkpoint integrity. Errors will be 
         #                 logged and cause the file to be marked as failed, but won't crash the worker or lose progress on 
         #                 previous rows.
         try:            
-            parsed_payment = self._payment_processor.process_row(row)            
-            RabbitMQHelper.send_p2p_message("TEST.QUEUE", parsed_payment)
+            parsed_payment = self._payment_processor.process_row(row)
+            request_queue = ConfigLoader.get("OFTL_RABITMQ_REQUEST_QUEUE", "ISO.PAYMENTS.CSV.REQ")
+            RabbitMQHelper.send_p2p_message(request_queue, parsed_payment)
 
             _ = (parsed_payment, row_number, file_path)
         except Exception as exc:

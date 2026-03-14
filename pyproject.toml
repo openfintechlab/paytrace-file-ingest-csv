@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
   "environs",
+  "jsonschema>=4.23.0",
   "sqlalchemy",
   "psycopg2-binary",
   "pytest",

@@ -1,4 +1,5 @@
 import asyncio
+import csv
 from datetime import datetime as real_datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -119,3 +120,80 @@ def test_move_to_archive_creates_date_partitioned_path(watcher_agent, monkeypatc
     assert archived.parent == watcher_agent.archive_dir / "2026" / "01" / "15"
     assert archived.name.startswith("sample.20260115T083045Z")
     assert archived.suffix == ".csv"
+
+
+def test_stream_process_csv_uses_file_header_for_legacy_column_layout(watcher_agent, monkeypatch, tmp_path):
+    csv_file = tmp_path / "legacy.csv"
+    with csv_file.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "transfer_id",
+                "transfer_type",
+                "transaction_datetime",
+                "amount",
+                "currency",
+                "purpose_code",
+                "charge_bearer",
+                "exchange_rate",
+                "requested_execution_date",
+                "debtor_name",
+                "debtor_country",
+                "debtor_account_scheme",
+                "debtor_account_id",
+                "debtor_bank_id_scheme",
+                "debtor_bank_id",
+                "creditor_name",
+                "creditor_country",
+                "creditor_account_scheme",
+                "creditor_account_id",
+                "creditor_bank_id_scheme",
+                "creditor_bank_id",
+                "remittance_unstructured",
+                "remittance_reference",
+            ]
+        )
+        writer.writerow(
+            [
+                "PTX-0000001",
+                "DOMESTIC",
+                "2026-03-03T10:15:30Z",
+                "2500.00",
+                "AED",
+                "SUPP",
+                "SHAR",
+                "",
+                "2026-03-04",
+                "Sharjah Trading LLC",
+                "AE",
+                "IBAN",
+                "AE070331234567890123456",
+                "OTHER",
+                "SIBUAEAD",
+                "Desert Supplies FZC",
+                "AE",
+                "IBAN",
+                "AE170540123456789012345",
+                "OTHER",
+                "EBILAEAD",
+                "Invoice 7843 - office supplies",
+                "INV-7843",
+            ]
+        )
+
+    observed: dict[str, object] = {}
+
+    def _capture(row_payload, row_number, _file_path):
+        observed["row_payload"] = row_payload
+        observed["row_number"] = row_number
+
+    monkeypatch.setattr(watcher_agent, "_process_csv_row", _capture)
+    monkeypatch.setattr(watcher_agent, "_checkpoint_upsert", lambda *_args, **_kwargs: None)
+
+    processed_rows = watcher_agent._stream_process_csv(csv_file, "file-123", resume_row=0)
+
+    assert processed_rows == 2
+    assert observed["row_number"] == 2
+    assert observed["row_payload"]["remittance_reference"] == "INV-7843"
+    assert observed["row_payload"]["remittance_unstructured"] == "Invoice 7843 - office supplies"
+    assert "intermediary_bank_bic" not in observed["row_payload"]

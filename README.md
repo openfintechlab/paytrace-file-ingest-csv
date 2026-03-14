@@ -8,6 +8,7 @@ This project provides a production-style CSV ingest worker for PayTrace, plus sh
 - Centralized application logging (`Logging`)
 - PostgreSQL connection and query helpers using SQLAlchemy (`DBHelper`)
 - CSV file watcher + scanner with claim/checkpoint/idempotency/archive semantics (`FileWatcherAgent`)
+- JSON Schema driven payment instruction validation, typing, and CSV column mapping (`src/domain/payment_instruction.schema.json`)
 - A startup entrypoint (`src/main.py`) that starts the watcher service
 
 ## Project Structure
@@ -15,9 +16,10 @@ This project provides a production-style CSV ingest worker for PayTrace, plus sh
 ```text
 src/
   main.py                  # Entrypoint (banner + starts FileWatcherAgent)
-  domain/                   # Placeholder for domain models, schemas, business logic
-    PaymentModel.py         # Pydantic model for payment data (not currently used in processing)
-    PaymentProcessor.py     # Domain class for payment processing logic (called from FileWatcher)
+  domain/                  # Payment schema, typed model, and row parsing logic
+    PaymentModel.py        # JSON Schema driven payment model and validation/coercion
+    PaymentProcessor.py    # Maps CSV rows to the schema-driven PaymentModel
+    payment_instruction.schema.json  # Single source of truth for payment fields and validation rules
   utilities/
     ConfigLoader.py        # OFTL_* configuration discovery and access
     Logging.py             # Logging bootstrap and helper methods
@@ -67,6 +69,15 @@ uv run python src/main.py
 6. Moves failed files to `error/`.
 
 `FileWatcher.py::_process_csv_row(...)` is the integration point for project-specific business logic.
+
+## Payment Schema Model
+
+`src/domain/payment_instruction.schema.json` is the single source of truth for payment instructions.
+
+- `PaymentModel` builds its fields dynamically from the schema properties.
+- `PAYMENT_CSV_COLUMNS` is derived from the schema property order and is used when parsing headerless rows.
+- Type coercion is driven by schema definitions, including `date-time`, `date`, and numeric fields.
+- Schema changes should be made in `payment_instruction.schema.json`; the model and CSV mapping update automatically on the next run.
 
 ## Configuration Reference
 
@@ -151,9 +162,13 @@ Run tests with:
 uv run pytest tests -v
 ```
 
+Run `uv sync` first so declared dependencies such as `jsonschema` and `sqlalchemy` are available in the project environment.
+
 At present, `test_config_loader.py` aligns with the current utility code. `test_routes.py` is a legacy file that still assumes a FastAPI app exists.
 
 ## CSV File Format
+
+The canonical field definitions live in `src/domain/payment_instruction.schema.json`. The table below mirrors the current schema for quick reference.
 
 | Column Name              | Data Type        | Mandatory (Y/N) | Sample Value            | Description                                        | Allowed / Probable Values    | Open Standard Reference  |
 | ------------------------ | ---------------- | --------------- | ----------------------- | -------------------------------------------------- | ---------------------------- | ------------------------ |
@@ -218,6 +233,7 @@ PTX-0000002,CROSS_BORDER,2026-03-03T10:20:00Z,2026-03-04,1200.00,USD,INVC,SHAR,3
 - `environs`
 - `sqlalchemy`
 - `psycopg2-binary`
+- `jsonschema`
 - `watchfiles`
 - `pika`
 - `pytest`
