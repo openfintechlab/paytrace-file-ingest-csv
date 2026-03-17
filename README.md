@@ -28,7 +28,9 @@ src/
     RabbitMQHelper.py      # RabbitMQ queue/exchange messaging helper
 tests/
   test_config_loader.py    # Unit tests for ConfigLoader
-  test_routes.py           # Legacy test file (references FastAPI app not present in current src/main.py)
+  test_file_watcher.py     # Unit tests for FileWatcherAgent
+  test_payment_model.py    # Unit tests for PaymentModel and PaymentProcessor
+  conftest.py              # Pytest configuration and fixtures
 ```
 
 ## Prerequisites
@@ -133,6 +135,8 @@ uv run python src/main.py
 - `OFTL_RABITMQ_EXCHANGE_TYPE` (default: `direct`)
 - `OFTL_RABITMQ_MESSAGE_PERSISTENT` (default: `true`)
 - `OFTL_RABITMQ_PUBLISH_MANDATORY` (default: `false`)
+- `OFTL_RABITMQ_DOEMSTIC_REQUEST_QUEUE` (default: `CSV.PAYMENTS.DOMESTIC.REQ`) — Queue name for domestic payment transfer requests
+- `OFTL_RABITMQ_CROSS_BORDER_REQUEST_QUEUE` (default: `CSV.PAYMENTS.CROSS_BORDER.REQ`) — Queue name for cross-border payment transfer requests
 
 ## Database Objects
 
@@ -162,9 +166,11 @@ Run tests with:
 uv run pytest tests -v
 ```
 
-Run `uv sync` first so declared dependencies such as `jsonschema` and `sqlalchemy` are available in the project environment.
+Run `uv sync` first to ensure all dependencies are available in the project environment. Test coverage includes:
 
-At present, `test_config_loader.py` aligns with the current utility code. `test_routes.py` is a legacy file that still assumes a FastAPI app exists.
+- `test_config_loader.py` — Configuration loading and environment variable resolution
+- `test_file_watcher.py` — File watcher scanning, claiming, and processing logic  
+- `test_payment_model.py` — Payment model validation, type coercion, and CSV parsing
 
 ## CSV File Format
 
