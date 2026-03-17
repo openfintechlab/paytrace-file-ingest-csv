@@ -384,7 +384,11 @@ class FileWatcherAgent:
         #                 previous rows.
         try:            
             parsed_payment = self._payment_processor.process_row(row)
-            request_queue = ConfigLoader.get("OFTL_RABITMQ_REQUEST_QUEUE", "ISO.PAYMENTS.CSV.REQ")
+            request_queue:str = ""
+            if parsed_payment.transfer_type == "DOMESTIC":
+                request_queue = ConfigLoader.get("OFTL_RABITMQ_DOEMSTIC_REQUEST_QUEUE", "CSV.PAYMENTS.DOMESTIC.REQ")
+            elif parsed_payment.transfer_type == "CROSS_BORDER":
+                request_queue = ConfigLoader.get("OFTL_RABITMQ_CROSS_BORDER_REQUEST_QUEUE", "CSV.PAYMENTS.CROSS_BORDER.REQ")
             RabbitMQHelper.send_p2p_message(request_queue, parsed_payment)
 
             _ = (parsed_payment, row_number, file_path)

@@ -5,13 +5,13 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from .PaymentModel import PAYMENT_CSV_COLUMNS, PaymentModel, _PaymentModelBase
+from .PaymentModel import PAYMENT_CSV_COLUMNS, PaymentModel
 
 
 class PaymentProcessor:
     """Parses CSV rows into PaymentModel."""
 
-    def process_row(self, csv_row: list[str] | Mapping[str, str]) -> _PaymentModelBase:
+    def process_row(self, csv_row: list[str] | Mapping[str, str]) -> PaymentModel:
         if isinstance(csv_row, Mapping):
             return PaymentModel.from_mapping(csv_row)
 
