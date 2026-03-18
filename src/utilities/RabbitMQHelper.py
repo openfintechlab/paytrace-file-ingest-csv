@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import atexit
 import json
+import time
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
 from decimal import Decimal
-from threading import Lock
+from threading import RLock
 from typing import TYPE_CHECKING, Any
 
 from .ConfigLoader import ConfigLoader
@@ -25,18 +26,35 @@ if TYPE_CHECKING:
     from pika.adapters.blocking_connection import BlockingChannel
 
 
+class RabbitMQConnectionError(RuntimeError):
+    """Raised when RabbitMQ connection retries are exhausted."""
+
+
 class RabbitMQHelper:
     """Singleton RabbitMQ helper for queue-send and exchange-publish operations."""
 
     _connection = None
     _channel: BlockingChannel | None = None
-    _lock: Lock = Lock()
+    _lock: RLock = RLock()
     _delivery_confirm_enabled = False
 
     @classmethod
     def initialize_connection(cls) -> None:
         """Initialize singleton connection/channel at application startup."""
-        cls._ensure_channel()
+        try:
+            cls._ensure_channel()
+        except RabbitMQConnectionError:
+            raise
+        except Exception as exc:
+            cls.close()
+            raise RabbitMQConnectionError(
+                "Unable to connect to RabbitMQ during application startup."
+            ) from exc
+
+    @classmethod
+    def _connection_retry_count(cls) -> int:
+        retry_count = int(ConfigLoader.get("OFTL_RABITMQ_CONN_RETRYCOUNT", 3))
+        return max(retry_count, 1)
 
     @classmethod
     def _as_bool(cls, value: Any, default: bool) -> bool:
@@ -55,9 +73,9 @@ class RabbitMQHelper:
         virtual_host = str(ConfigLoader.get("OFTL_RABITMQ_VHOST", "/"))
         heartbeat = int(ConfigLoader.get("OFTL_RABITMQ_HEARTBEAT", 60))
         blocked_timeout = float(ConfigLoader.get("OFTL_RABITMQ_BLOCKED_CONNECTION_TIMEOUT", 30))
-        connection_attempts = int(ConfigLoader.get("OFTL_RABITMQ_CONNECTION_ATTEMPTS", 3))
         retry_delay = float(ConfigLoader.get("OFTL_RABITMQ_RETRY_DELAY", 2))
         socket_timeout = float(ConfigLoader.get("OFTL_RABITMQ_SOCKET_TIMEOUT", 5))
+        stack_timeout = float(ConfigLoader.get("OFTL_RABITMQ_STACK_TIMEOUT", 10))
 
         credentials = pika_module.PlainCredentials(username=username, password=password)
         return pika_module.ConnectionParameters(
@@ -66,9 +84,10 @@ class RabbitMQHelper:
             virtual_host=virtual_host,
             heartbeat=heartbeat,
             blocked_connection_timeout=blocked_timeout,
-            connection_attempts=connection_attempts,
-            retry_delay=retry_delay,
+            connection_attempts=1,
+            retry_delay=0,
             socket_timeout=socket_timeout,
+            stack_timeout=stack_timeout,
             credentials=credentials,
         )
 
@@ -85,27 +104,47 @@ class RabbitMQHelper:
             channel_closed = cls._channel is None or cls._channel.is_closed
 
             if connection_closed or channel_closed:
-                if cls._channel is not None:
-                    try:
-                        cls._channel.close()
-                    except Exception:
-                        pass
-                if cls._connection is not None:
-                    try:
-                        cls._connection.close()
-                    except Exception:
-                        pass
-
-                params = cls._build_connection_parameters()
-                pika_module = cls._require_pika()
-                cls._connection = pika_module.BlockingConnection(params)
-                cls._channel = cls._connection.channel()
-                cls._delivery_confirm_enabled = False
-                Logging.info("RabbitMQ connection established.")
+                cls._connect_with_retry()
 
             if cls._channel is None:  # pragma: no cover
                 raise RuntimeError("RabbitMQ channel initialization failed.")
             return cls._channel
+
+    @classmethod
+    def _connect_with_retry(cls) -> None:
+        retry_count = cls._connection_retry_count()
+        retry_delay = float(ConfigLoader.get("OFTL_RABITMQ_RETRY_DELAY", 2))
+        last_error: Exception | None = None
+
+        for attempt in range(1, retry_count + 1):
+            try:
+                Logging.info("RabbitMQ connection attempt %s of %s.", attempt, retry_count)
+                cls._open_connection()
+                return
+            except Exception as exc:
+                last_error = exc
+                cls.close()
+                Logging.error(
+                    "RabbitMQ connection attempt %s of %s failed: %s",
+                    attempt,
+                    retry_count,
+                    exc,
+                )
+                if attempt < retry_count:
+                    time.sleep(retry_delay)
+
+        raise RabbitMQConnectionError(
+            f"Unable to connect to RabbitMQ after {retry_count} attempts."
+        ) from last_error
+
+    @classmethod
+    def _open_connection(cls) -> None:
+        params = cls._build_connection_parameters()
+        pika_module = cls._require_pika()
+        cls._connection = pika_module.BlockingConnection(params)
+        cls._channel = cls._connection.channel()
+        cls._delivery_confirm_enabled = False
+        Logging.info("RabbitMQ connection established.")
 
     @classmethod
     def _ensure_delivery_confirmation(cls, channel: BlockingChannel) -> None:
@@ -171,10 +210,9 @@ class RabbitMQHelper:
 
         try:
             return _send_once()
-        except Exception as exc:
-            Logging.warning("RabbitMQ send failed, retrying once: %s", exc)
+        except Exception:
             cls.close()
-            return _send_once()
+            raise
 
     @classmethod
     def publish_message(
@@ -218,10 +256,9 @@ class RabbitMQHelper:
 
         try:
             return _publish_once()
-        except Exception as exc:
-            Logging.warning("RabbitMQ publish failed, retrying once: %s", exc)
+        except Exception:
             cls.close()
-            return _publish_once()
+            raise
 
     @classmethod
     def close(cls) -> None:

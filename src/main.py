@@ -12,12 +12,12 @@ try:
     from utilities.ConfigLoader import ConfigLoader
     from utilities.FileWatcher import FileWatcherAgent
     from utilities.Logging import Logging
-    from utilities.RabbitMQHelper import RabbitMQHelper
+    from utilities.RabbitMQHelper import RabbitMQConnectionError, RabbitMQHelper
 except ModuleNotFoundError:
     from src.utilities.ConfigLoader import ConfigLoader
     from src.utilities.FileWatcher import FileWatcherAgent
     from src.utilities.Logging import Logging
-    from src.utilities.RabbitMQHelper import RabbitMQHelper
+    from src.utilities.RabbitMQHelper import RabbitMQConnectionError, RabbitMQHelper
 
 _DEFAULT_LOG_LEVEL = "INFO"
 _DEFAULT_ROOT_DIR = "./fwcsv"
@@ -49,6 +49,10 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         Logging.warning("Shutdown requested by user.")
         sys.exit(0)
+    except RabbitMQConnectionError as exc:
+        Logging.error("Error starting file watcher service")
+        Logging.error(str(exc))
+        sys.exit(99)
     except Exception as exc:
         Logging.error("Error starting file watcher service")
         Logging.error(str(exc))
