@@ -30,6 +30,10 @@ class RabbitMQConnectionError(RuntimeError):
     """Raised when RabbitMQ connection retries are exhausted."""
 
 
+class RabbitMQShutdownRequested(RuntimeError):
+    """Raised when the service must stop because RabbitMQ is unavailable."""
+
+
 class RabbitMQHelper:
     """Singleton RabbitMQ helper for queue-send and exchange-publish operations."""
 
@@ -40,20 +44,33 @@ class RabbitMQHelper:
 
     @classmethod
     def initialize_connection(cls) -> None:
-        """Initialize singleton connection/channel at application startup."""
+        """Validate RabbitMQ startup connectivity and exit the service if unavailable."""
         try:
-            cls._ensure_channel()
-        except RabbitMQConnectionError:
+            cls._require_pika()
+            cls._build_connection_parameters()
+            cls._connect_with_retry()
+            cls.close()
+        except RabbitMQShutdownRequested:
             raise
+        except RabbitMQConnectionError as exc:
+            cls.close()
+            cls._exit_application(exc)
         except Exception as exc:
             cls.close()
-            raise RabbitMQConnectionError(
-                "Unable to connect to RabbitMQ during application startup."
-            ) from exc
+            cls._exit_application(
+                RabbitMQConnectionError(
+                    "Unable to connect to RabbitMQ during application startup."
+                )
+            )
 
     @classmethod
     def _connection_retry_count(cls) -> int:
-        retry_count = int(ConfigLoader.get("OFTL_RABITMQ_CONN_RETRYCOUNT", 3))
+        retry_count = int(
+            ConfigLoader.get(
+                "OFTL_RABITMQ_CONNECTION_ATTEMPTS",
+                ConfigLoader.get("OFTL_RABITMQ_CONN_RETRYCOUNT", 3),
+            )
+        )
         return max(retry_count, 1)
 
     @classmethod
@@ -73,9 +90,9 @@ class RabbitMQHelper:
         virtual_host = str(ConfigLoader.get("OFTL_RABITMQ_VHOST", "/"))
         heartbeat = int(ConfigLoader.get("OFTL_RABITMQ_HEARTBEAT", 60))
         blocked_timeout = float(ConfigLoader.get("OFTL_RABITMQ_BLOCKED_CONNECTION_TIMEOUT", 30))
+        connection_attempts = int(ConfigLoader.get("OFTL_RABITMQ_CONNECTION_ATTEMPTS", 3))
         retry_delay = float(ConfigLoader.get("OFTL_RABITMQ_RETRY_DELAY", 2))
-        socket_timeout = float(ConfigLoader.get("OFTL_RABITMQ_SOCKET_TIMEOUT", 5))
-        stack_timeout = float(ConfigLoader.get("OFTL_RABITMQ_STACK_TIMEOUT", 10))
+        socket_timeout = float(ConfigLoader.get("OFTL_RABITMQ_SOCKET_TIMEOUT", 5))        
 
         credentials = pika_module.PlainCredentials(username=username, password=password)
         return pika_module.ConnectionParameters(
@@ -84,12 +101,21 @@ class RabbitMQHelper:
             virtual_host=virtual_host,
             heartbeat=heartbeat,
             blocked_connection_timeout=blocked_timeout,
-            connection_attempts=1,
-            retry_delay=0,
-            socket_timeout=socket_timeout,
-            stack_timeout=stack_timeout,
+            connection_attempts=connection_attempts,
+            retry_delay=retry_delay,
+            socket_timeout=socket_timeout,            
             credentials=credentials,
         )
+
+    @classmethod
+    def _exit_application(cls, exc: BaseException | None = None) -> None:
+        message = "RabbitMQ connection failed after configured retries. Exiting application with code 99."
+        if exc is not None:
+            Logging.error("%s Root cause: %s", message, exc)
+        else:
+            Logging.error(message)
+        raise RabbitMQShutdownRequested(message)
+
 
     @classmethod
     def _require_pika(cls) -> Any:
@@ -104,7 +130,10 @@ class RabbitMQHelper:
             channel_closed = cls._channel is None or cls._channel.is_closed
 
             if connection_closed or channel_closed:
-                cls._connect_with_retry()
+                try:
+                    cls._connect_with_retry()
+                except RabbitMQConnectionError as exc:
+                    cls._exit_application(exc)
 
             if cls._channel is None:  # pragma: no cover
                 raise RuntimeError("RabbitMQ channel initialization failed.")
@@ -115,10 +144,18 @@ class RabbitMQHelper:
         retry_count = cls._connection_retry_count()
         retry_delay = float(ConfigLoader.get("OFTL_RABITMQ_RETRY_DELAY", 2))
         last_error: Exception | None = None
+        host = str(ConfigLoader.get("OFTL_RABITMQ_HOST", "localhost"))
+        port = int(ConfigLoader.get("OFTL_RABITMQ_PORT", 5672))
 
         for attempt in range(1, retry_count + 1):
             try:
-                Logging.info("RabbitMQ connection attempt %s of %s.", attempt, retry_count)
+                Logging.info(
+                    "RabbitMQ connection attempt %s of %s to %s:%s.",
+                    attempt,
+                    retry_count,
+                    host,
+                    port,
+                )
                 cls._open_connection()
                 return
             except Exception as exc:
@@ -134,7 +171,7 @@ class RabbitMQHelper:
                     time.sleep(retry_delay)
 
         raise RabbitMQConnectionError(
-            f"Unable to connect to RabbitMQ after {retry_count} attempts."
+            f"Unable to connect to RabbitMQ at {host}:{port} after {retry_count} attempts."
         ) from last_error
 
     @classmethod
@@ -180,6 +217,69 @@ class RabbitMQHelper:
         raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
     @classmethod
+    def _is_recoverable_connection_error(cls, exc: Exception) -> bool:
+        pika_module = pika
+        if pika_module is not None:
+            pika_exceptions = getattr(pika_module, "exceptions", None)
+            recoverable_types = tuple(
+                exc_type
+                for exc_name in (
+                    "AMQPConnectionError",
+                    "AMQPChannelError",
+                    "ConnectionWrongStateError",
+                    "ChannelWrongStateError",
+                    "StreamLostError",
+                    "ConnectionClosed",
+                    "ChannelClosed",
+                    "ChannelClosedByBroker",
+                )
+                if pika_exceptions is not None and (exc_type := getattr(pika_exceptions, exc_name, None)) is not None
+            )
+            if recoverable_types and isinstance(exc, recoverable_types):
+                return True
+
+        error_text = str(exc).lower()
+        return any(
+            marker in error_text
+            for marker in (
+                "connection lost",
+                "connection reset",
+                "connection closed",
+                "stream lost",
+                "channel closed",
+                "broken pipe",
+            )
+        )
+
+    @classmethod
+    def _run_operation_with_retry(cls, operation_name: str, operation: Any) -> bool:
+        retry_count = cls._connection_retry_count()
+        retry_delay = float(ConfigLoader.get("OFTL_RABITMQ_RETRY_DELAY", 2))
+        last_error: Exception | None = None
+
+        for attempt in range(1, retry_count + 1):
+            try:
+                return bool(operation())
+            except Exception as exc:
+                last_error = exc
+                should_retry = attempt < retry_count and cls._is_recoverable_connection_error(exc)
+                cls.close()
+                Logging.error(
+                    "RabbitMQ %s attempt %s of %s failed: %s",
+                    operation_name,
+                    attempt,
+                    retry_count,
+                    exc,
+                )
+                if not should_retry:
+                    raise
+                time.sleep(retry_delay)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"RabbitMQ {operation_name} failed without an explicit error.")
+
+    @classmethod
     def send_p2p_message(cls, queue_name: str, message: Any) -> bool:
         """Send a point-to-point message to a queue. Queue is created if missing."""
         durable_queue = cls._as_bool(ConfigLoader.get("OFTL_RABITMQ_QUEUE_DURABLE", "true"), True)
@@ -208,11 +308,7 @@ class RabbitMQHelper:
                 )
             )
 
-        try:
-            return _send_once()
-        except Exception:
-            cls.close()
-            raise
+        return cls._run_operation_with_retry("queue publish", _send_once)
 
     @classmethod
     def publish_message(
@@ -254,11 +350,7 @@ class RabbitMQHelper:
                 )
             )
 
-        try:
-            return _publish_once()
-        except Exception:
-            cls.close()
-            raise
+        return cls._run_operation_with_retry("exchange publish", _publish_once)
 
     @classmethod
     def close(cls) -> None:

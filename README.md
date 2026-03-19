@@ -127,8 +127,8 @@ uv run python src/main.py
 - `OFTL_RABITMQ_VHOST` (default: `/`)
 - `OFTL_RABITMQ_HEARTBEAT` (default: `60`)
 - `OFTL_RABITMQ_BLOCKED_CONNECTION_TIMEOUT` (default: `30`)
-- `OFTL_RABITMQ_CONNECTION_ATTEMPTS` (legacy Pika setting; helper now uses single-attempt broker dials to keep retries bounded)
-- `OFTL_RABITMQ_CONN_RETRYCOUNT` (default: `3`) - Total application-level connection retries before the worker exits
+- `OFTL_RABITMQ_CONNECTION_ATTEMPTS` (default: `3`) - Total application-level connection retries for startup and reconnect after a broker loss
+- `OFTL_RABITMQ_CONN_RETRYCOUNT` (legacy fallback) - Used only when `OFTL_RABITMQ_CONNECTION_ATTEMPTS` is not set
 - `OFTL_RABITMQ_RETRY_DELAY` (default: `2`)
 - `OFTL_RABITMQ_SOCKET_TIMEOUT` (default: `5`)
 - `OFTL_RABITMQ_STACK_TIMEOUT` (default: `10`)
@@ -140,7 +140,7 @@ uv run python src/main.py
 - `OFTL_RABITMQ_DOEMSTIC_REQUEST_QUEUE` (default: `CSV.PAYMENTS.DOMESTIC.REQ`) — Queue name for domestic payment transfer requests
 - `OFTL_RABITMQ_CROSS_BORDER_REQUEST_QUEUE` (default: `CSV.PAYMENTS.CROSS_BORDER.REQ`) — Queue name for cross-border payment transfer requests
 
-On startup, the worker attempts to connect to RabbitMQ up to `OFTL_RABITMQ_CONN_RETRYCOUNT` times. Each helper retry performs a single broker dial so the process does not hang inside nested Pika retries. If all attempts fail, the process exits with status code `99`.
+On startup, and again after a lost RabbitMQ connection during publish, the worker attempts to connect to RabbitMQ up to `OFTL_RABITMQ_CONNECTION_ATTEMPTS` times. Each helper retry performs a single broker dial so the process does not hang inside nested Pika retries. If all attempts fail, the process exits with status code `99`.
 
 ## Database Objects
 

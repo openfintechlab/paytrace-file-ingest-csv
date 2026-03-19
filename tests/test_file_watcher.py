@@ -1,5 +1,6 @@
 import asyncio
 import csv
+from threading import Event
 from datetime import datetime as real_datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ import pytest
 import src.utilities.FileWatcher as file_watcher_module
 from src.utilities.ConfigLoader import ConfigLoader
 from src.utilities.FileWatcher import ClaimedFile, FileWatcherAgent
+from src.utilities.RabbitMQHelper import RabbitMQShutdownRequested
 
 
 @pytest.fixture
@@ -197,3 +199,68 @@ def test_stream_process_csv_uses_file_header_for_legacy_column_layout(watcher_ag
     assert observed["row_payload"]["remittance_reference"] == "INV-7843"
     assert observed["row_payload"]["remittance_unstructured"] == "Invoice 7843 - office supplies"
     assert "intermediary_bank_bic" not in observed["row_payload"]
+
+
+def test_process_csv_row_reraises_rabbitmq_publish_errors(watcher_agent, monkeypatch, tmp_path):
+    file_path = tmp_path / "failed.csv"
+    parsed_payment = SimpleNamespace(transfer_type="DOMESTIC")
+
+    monkeypatch.setattr(watcher_agent._payment_processor, "process_row", lambda _row: parsed_payment)
+    monkeypatch.setattr(
+        file_watcher_module.RabbitMQHelper,
+        "send_p2p_message",
+        lambda _queue_name, _message: (_ for _ in ()).throw(RuntimeError("broker unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="broker unavailable"):
+        watcher_agent._process_csv_row({"transfer_type": "DOMESTIC"}, 2, file_path)
+
+
+def test_process_claimed_with_lock_skips_duplicate_active_path(watcher_agent, monkeypatch, tmp_path):
+    claimed = ClaimedFile(
+        source_name="duplicate.csv",
+        claimed_path=tmp_path / "processing" / "duplicate.csv",
+        fingerprint="file-123",
+        size=123,
+        mtime_ns=456,
+    )
+    claimed.claimed_path.parent.mkdir(parents=True, exist_ok=True)
+    claimed.claimed_path.write_text("a,b\n1,2\n", encoding="utf-8")
+
+    started = Event()
+    release = Event()
+    observed: list[str] = []
+
+    def _fake_process(_claimed):
+        observed.append("started")
+        started.set()
+        release.wait(timeout=2)
+        observed.append("finished")
+
+    monkeypatch.setattr(watcher_agent, "_process_claimed_file", _fake_process)
+
+    async def _run_test():
+        first = asyncio.create_task(watcher_agent._process_claimed_with_lock(claimed))
+        await asyncio.to_thread(started.wait, 2)
+        await watcher_agent._process_claimed_with_lock(claimed)
+        release.set()
+        await first
+
+    asyncio.run(_run_test())
+
+    assert observed == ["started", "finished"]
+
+
+def test_worker_loop_propagates_rabbitmq_shutdown(monkeypatch, watcher_agent):
+    async def _raise_shutdown(_path_str):
+        raise RabbitMQShutdownRequested("RabbitMQ connection failed after configured retries. Exiting application with code 99.")
+
+    monkeypatch.setattr(watcher_agent, "_handle_candidate", _raise_shutdown)
+
+    async def _run_test():
+        worker = asyncio.create_task(watcher_agent._worker_loop(1))
+        await watcher_agent._queue.put("/tmp/example.csv")
+        with pytest.raises(RabbitMQShutdownRequested):
+            await worker
+
+    asyncio.run(_run_test())

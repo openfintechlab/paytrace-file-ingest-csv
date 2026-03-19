@@ -21,7 +21,7 @@ except ModuleNotFoundError:  # pragma: no cover
 from .ConfigLoader import ConfigLoader
 from .DBHelper import DBHelper
 from .Logging import Logging
-from .RabbitMQHelper import RabbitMQHelper
+from .RabbitMQHelper import RabbitMQHelper, RabbitMQShutdownRequested
 try:
     from watchfiles import Change, awatch
 
@@ -64,6 +64,8 @@ class FileWatcherAgent:
         self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=self.queue_maxsize)
         self._enqueued_paths: set[str] = set()
         self._enqueued_lock = asyncio.Lock()
+        self._active_processing_paths: set[str] = set()
+        self._active_processing_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
         self._payment_processor = PaymentProcessor()
 
@@ -72,7 +74,7 @@ class FileWatcherAgent:
         self._bootstrap_directories()
         # [MFB-20260306]: Removing the feature of creating the database objects as this will cause issue since in production environment
         # the database user will not have permission to create tables. The expectation is that the DBA will run the provided SQL Scrpts
-        self._bootstrap_db_tables()
+        # self._bootstrap_db_tables()
 
         Logging.info("File watcher root directory: %s", self.root_dir)
         Logging.info("Watchfiles available: %s", WATCHFILES_AVAILABLE)
@@ -199,6 +201,9 @@ class FileWatcherAgent:
             path_str = await self._queue.get()
             try:
                 await self._handle_candidate(path_str)
+            except RabbitMQShutdownRequested:
+                self._stop_event.set()
+                raise
             except Exception as exc:  # pragma: no cover
                 Logging.error("Worker-%s failed for %s: %s", worker_id, path_str, exc)
             finally:
@@ -213,8 +218,11 @@ class FileWatcherAgent:
             return
 
         if self.processing_dir in path.parents:
-            claimed = self._build_claimed_from_processing(path)
-            await asyncio.to_thread(self._process_claimed_file, claimed)
+            try:
+                claimed = self._build_claimed_from_processing(path)
+            except FileNotFoundError:
+                return
+            await self._process_claimed_with_lock(claimed)
             return
 
         if self.inbox_dir not in path.parents:
@@ -222,7 +230,22 @@ class FileWatcherAgent:
 
         claimed = await self._claim_when_ready(path)
         if claimed is not None:
+            await self._process_claimed_with_lock(claimed)
+
+    async def _process_claimed_with_lock(self, claimed: ClaimedFile) -> None:
+        claim_key = str(claimed.claimed_path.resolve())
+
+        async with self._active_processing_lock:
+            if claim_key in self._active_processing_paths:
+                Logging.info("Skipping already active claimed file: %s", claimed.claimed_path)
+                return
+            self._active_processing_paths.add(claim_key)
+
+        try:
             await asyncio.to_thread(self._process_claimed_file, claimed)
+        finally:
+            async with self._active_processing_lock:
+                self._active_processing_paths.discard(claim_key)
 
     async def _claim_when_ready(self, inbox_path: Path) -> ClaimedFile | None:
         waited = 0.0
@@ -389,11 +412,18 @@ class FileWatcherAgent:
                 request_queue = ConfigLoader.get("OFTL_RABITMQ_DOEMSTIC_REQUEST_QUEUE", "CSV.PAYMENTS.DOMESTIC.REQ")
             elif parsed_payment.transfer_type == "CROSS_BORDER":
                 request_queue = ConfigLoader.get("OFTL_RABITMQ_CROSS_BORDER_REQUEST_QUEUE", "CSV.PAYMENTS.CROSS_BORDER.REQ")
+            else:
+                raise ValueError(f"Unsupported transfer type: {parsed_payment.transfer_type}")
+
+            if not request_queue:
+                raise ValueError("RabbitMQ request queue is not configured for the parsed payment.")
+
             RabbitMQHelper.send_p2p_message(request_queue, parsed_payment)
 
             _ = (parsed_payment, row_number, file_path)
         except Exception as exc:
             Logging.error("Error processing row %d in %s: %s", row_number, file_path, str(exc))
+            raise
 
             
     
