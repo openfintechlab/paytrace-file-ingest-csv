@@ -43,6 +43,11 @@ class ClaimedFile:
 
 class FileWatcherAgent:
     """Hybrid watcher/scanner with robust claim, checkpoint, and archiving semantics."""
+    _REQUIRED_TABLES = (
+        "oftl_fwcsv_registry",
+        "oftl_fwcsv_checkpoint",
+        "oftl_fwcsv_row_dispatch",
+    )
 
     def __init__(self) -> None:
         self.root_dir = Path(ConfigLoader.get("OFTL_FWCSV_ROOTDIR", "./fwcsv")).resolve()
@@ -72,9 +77,7 @@ class FileWatcherAgent:
     async def run_forever(self) -> None:
         Logging.info("Bootstrapping file watcher agent...")
         self._bootstrap_directories()
-        # [MFB-20260306]: Removing the feature of creating the database objects as this will cause issue since in production environment
-        # the database user will not have permission to create tables. The expectation is that the DBA will run the provided SQL Scrpts
-        # self._bootstrap_db_tables()
+        self._validate_dependencies()
 
         Logging.info("File watcher root directory: %s", self.root_dir)
         Logging.info("Watchfiles available: %s", WATCHFILES_AVAILABLE)
@@ -98,6 +101,35 @@ class FileWatcherAgent:
             for task in tasks:
                 if not task.done():
                     task.cancel()
+
+    def _validate_dependencies(self) -> None:
+        if not DBHelper.initialize_connection():
+            raise RuntimeError("Database is required for checkpoint/idempotency and could not be initialized.")
+        self._validate_required_tables()
+
+    def _validate_required_tables(self) -> None:
+        schema = str(ConfigLoader.get("OFTL_POSTGRESDB_SCHEMA", "public")).strip() or "public"
+        missing_tables: list[str] = []
+
+        for table_name in self._REQUIRED_TABLES:
+            rows = DBHelper.execute_select(
+                "SELECT to_regclass(:qualified_name) AS relation_name",
+                {"qualified_name": f"{schema}.{table_name}"},
+            )
+            relation_name = rows[0].get("relation_name") if rows else None
+            if relation_name is None:
+                missing_tables.append(table_name)
+
+        if missing_tables:
+            raise RuntimeError(
+                f"Missing required database tables in schema {schema}: {', '.join(sorted(missing_tables))}"
+            )
+
+        Logging.info_context(
+            "Validated database dependencies for file watcher agent.",
+            schema=schema,
+            required_tables=",".join(self._REQUIRED_TABLES),
+        )
 
     def _bootstrap_directories(self) -> None:
         for folder in (self.inbox_dir, self.processing_dir, self.archive_dir, self.error_dir):
@@ -343,11 +375,19 @@ class FileWatcherAgent:
         existing = self._registry_get(claimed.fingerprint)
 
         if existing and existing.get("checksum_sha256") and existing["checksum_sha256"] != checksum:
-            Logging.warning("Checksum mismatch for %s. Resetting checkpoint.", claimed.source_name)
+            Logging.warning_context(
+                "Checksum mismatch detected. Resetting checkpoint.",
+                file_id=claimed.fingerprint,
+                filename=claimed.source_name,
+            )
             self._checkpoint_delete(claimed.fingerprint)
 
         if existing and existing.get("status") == "completed" and existing.get("checksum_sha256") == checksum:
-            Logging.info("Idempotency skip (already completed): %s", claimed.source_name)
+            Logging.info_context(
+                "Idempotency skip for completed file.",
+                file_id=claimed.fingerprint,
+                filename=claimed.source_name,
+            )
             self._move_to_archive(claimed.claimed_path, suffix="duplicate")
             return
 
@@ -371,16 +411,15 @@ class FileWatcherAgent:
 
     def _stream_process_csv(self, file_path: Path, file_id: str, resume_row: int) -> int:
         row_number = 0
-        Logging.info("Starting processing file: %s", file_path)
+        Logging.info_context("Starting processing file.", file_id=file_id, file_path=str(file_path), resume_row=resume_row)
         with file_path.open("r", encoding=self.file_encoding, newline="") as handle:
             reader = csv.reader(handle)
             header: list[str] | None = None
             for row in reader:
                 row_number += 1
-                # [MFB-20260303]: Added header row skip and resume capability.                
                 if row_number == 1:
                     header = [column.strip() for column in row]
-                    Logging.info("Skipping header row for %s", file_path)
+                    Logging.info_context("Skipping header row.", file_id=file_id, file_path=str(file_path))
                     continue
 
                 if row_number <= resume_row:
@@ -394,19 +433,23 @@ class FileWatcherAgent:
                         )
                     row_payload = dict(zip(header, row))
 
-                self._process_csv_row(row_payload, row_number, file_path)
-                if row_number % self.checkpoint_every_rows == 0:
-                    self._checkpoint_upsert(file_id, row_number)
-                
-        Logging.info("Completed processing file: %s, total rows: %d", file_path, row_number)
+                self._process_csv_row(row_payload, row_number, file_path, file_id=file_id)
+                self._checkpoint_upsert(file_id, row_number)
+
+        Logging.info_context("Completed processing file.", file_id=file_id, file_path=str(file_path), total_rows=row_number)
         return row_number
 
-    def _process_csv_row(self, row: list[str] | dict[str, str], row_number: int, file_path: Path) -> None:
-        # [MFB-20260304]: Wrapped processing in try/except to ensure robustness and checkpoint integrity. Errors will be 
-        #                 logged and cause the file to be marked as failed, but won't crash the worker or lose progress on 
-        #                 previous rows.
+    def _process_csv_row(
+        self,
+        row: list[str] | dict[str, str],
+        row_number: int,
+        file_path: Path,
+        *,
+        file_id: str | None = None,
+    ) -> None:
         try:            
             parsed_payment = self._payment_processor.process_row(row)
+            transfer_id = str(parsed_payment.transfer_id)
             request_queue:str = ""
             if parsed_payment.transfer_type == "DOMESTIC":
                 request_queue = ConfigLoader.get("OFTL_RABITMQ_DOEMSTIC_REQUEST_QUEUE", "CSV.PAYMENTS.DOMESTIC.REQ")
@@ -418,11 +461,51 @@ class FileWatcherAgent:
             if not request_queue:
                 raise ValueError("RabbitMQ request queue is not configured for the parsed payment.")
 
-            RabbitMQHelper.send_p2p_message(request_queue, parsed_payment)
+            existing_dispatch = self._row_dispatch_get(transfer_id)
+            if existing_dispatch and existing_dispatch.get("status") == "published":
+                Logging.info_context(
+                    "Skipping already published payment row.",
+                    transfer_id=transfer_id,
+                    file_id=file_id or "unknown",
+                    row_number=row_number,
+                    request_queue=request_queue,
+                )
+                return
+
+            RabbitMQHelper.send_p2p_message(
+                request_queue,
+                parsed_payment,
+                correlation_id=transfer_id,
+                message_id=transfer_id,
+                headers={"transfer_id": transfer_id, "file_id": file_id or "", "row_number": row_number},
+            )
+            self._row_dispatch_mark_published(
+                transfer_id=transfer_id,
+                file_id=file_id or "",
+                row_number=row_number,
+                request_queue=request_queue,
+            )
 
             _ = (parsed_payment, row_number, file_path)
         except Exception as exc:
-            Logging.error("Error processing row %d in %s: %s", row_number, file_path, str(exc))
+            transfer_id = ""
+            if isinstance(row, dict):
+                transfer_id = str(row.get("transfer_id", "") or "")
+            if transfer_id:
+                self._row_dispatch_mark_failed(
+                    transfer_id=transfer_id,
+                    file_id=file_id or "",
+                    row_number=row_number,
+                    error_message=str(exc),
+                )
+            Logging.error_context(
+                "Error processing payment row.",
+                transfer_id=transfer_id or "unknown",
+                file_id=file_id or "unknown",
+                file_path=str(file_path),
+                row_number=row_number,
+                error=str(exc),
+            )
             raise
 
             
@@ -545,6 +628,81 @@ class FileWatcherAgent:
         DBHelper.execute_delete(
             "DELETE FROM oftl_fwcsv_checkpoint WHERE file_id = :file_id",
             {"file_id": file_id},
+        )
+
+    def _row_dispatch_get(self, transfer_id: str) -> dict[str, Any] | None:
+        rows = DBHelper.execute_select(
+            """
+            SELECT transfer_id, file_id, row_number, request_queue, status, published_at, error_message
+            FROM oftl_fwcsv_row_dispatch
+            WHERE transfer_id = :transfer_id
+            """,
+            {"transfer_id": transfer_id},
+        )
+        return rows[0] if rows else None
+
+    def _row_dispatch_mark_published(
+        self,
+        *,
+        transfer_id: str,
+        file_id: str,
+        row_number: int,
+        request_queue: str,
+    ) -> None:
+        DBHelper.execute_update(
+            """
+            INSERT INTO oftl_fwcsv_row_dispatch (
+                transfer_id, file_id, row_number, request_queue, status, published_at, updated_at, error_message
+            ) VALUES (
+                :transfer_id, :file_id, :row_number, :request_queue, 'published', NOW(), NOW(), NULL
+            )
+            ON CONFLICT (transfer_id) DO UPDATE
+            SET
+                file_id = EXCLUDED.file_id,
+                row_number = EXCLUDED.row_number,
+                request_queue = EXCLUDED.request_queue,
+                status = 'published',
+                published_at = NOW(),
+                updated_at = NOW(),
+                error_message = NULL
+            """,
+            {
+                "transfer_id": transfer_id,
+                "file_id": file_id,
+                "row_number": row_number,
+                "request_queue": request_queue,
+            },
+        )
+
+    def _row_dispatch_mark_failed(
+        self,
+        *,
+        transfer_id: str,
+        file_id: str,
+        row_number: int,
+        error_message: str,
+    ) -> None:
+        DBHelper.execute_update(
+            """
+            INSERT INTO oftl_fwcsv_row_dispatch (
+                transfer_id, file_id, row_number, request_queue, status, published_at, updated_at, error_message
+            ) VALUES (
+                :transfer_id, :file_id, :row_number, '', 'failed', NULL, NOW(), :error_message
+            )
+            ON CONFLICT (transfer_id) DO UPDATE
+            SET
+                file_id = EXCLUDED.file_id,
+                row_number = EXCLUDED.row_number,
+                status = 'failed',
+                updated_at = NOW(),
+                error_message = EXCLUDED.error_message
+            """,
+            {
+                "transfer_id": transfer_id,
+                "file_id": file_id,
+                "row_number": row_number,
+                "error_message": error_message[:2000],
+            },
         )
 
     def _move_to_archive(self, path: Path, suffix: str | None = None) -> Path:

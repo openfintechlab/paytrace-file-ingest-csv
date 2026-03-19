@@ -99,7 +99,7 @@ class DBHelper:
             try:
                 connection_url, db_schema = cls._build_connection_url_and_schema()
             except ValueError as exc:
-                Logging.warning(f"Database initialization skipped: {exc}")
+                Logging.warning_context("Database initialization skipped.", error=str(exc))
                 return False
 
             raw_pool_size = ConfigLoader.get(
@@ -129,13 +129,18 @@ class DBHelper:
             try:
                 with cls._engine.connect() as connection:
                     connection.execute(text("SELECT 1"))
-                Logging.info(
-                    "Database connection initialized successfully with schema: %s",
-                    db_schema,
+                Logging.info_context(
+                    "Database connection initialized successfully.",
+                    schema=db_schema,
+                    pool_size=pool_size,
                 )
                 return True
             except SQLAlchemyError as exc:
-                Logging.error(f"Database connectivity check failed: {exc}")
+                Logging.error_context(
+                    "Database connectivity check failed.",
+                    schema=db_schema,
+                    error=str(exc),
+                )
                 cls.dispose_connection()
                 return False
 

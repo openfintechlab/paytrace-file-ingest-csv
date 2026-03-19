@@ -90,9 +90,8 @@ class RabbitMQHelper:
         virtual_host = str(ConfigLoader.get("OFTL_RABITMQ_VHOST", "/"))
         heartbeat = int(ConfigLoader.get("OFTL_RABITMQ_HEARTBEAT", 60))
         blocked_timeout = float(ConfigLoader.get("OFTL_RABITMQ_BLOCKED_CONNECTION_TIMEOUT", 30))
-        connection_attempts = int(ConfigLoader.get("OFTL_RABITMQ_CONNECTION_ATTEMPTS", 3))
-        retry_delay = float(ConfigLoader.get("OFTL_RABITMQ_RETRY_DELAY", 2))
-        socket_timeout = float(ConfigLoader.get("OFTL_RABITMQ_SOCKET_TIMEOUT", 5))        
+        socket_timeout = float(ConfigLoader.get("OFTL_RABITMQ_SOCKET_TIMEOUT", 5))
+        stack_timeout = float(ConfigLoader.get("OFTL_RABITMQ_STACK_TIMEOUT", 10))
 
         credentials = pika_module.PlainCredentials(username=username, password=password)
         return pika_module.ConnectionParameters(
@@ -101,9 +100,10 @@ class RabbitMQHelper:
             virtual_host=virtual_host,
             heartbeat=heartbeat,
             blocked_connection_timeout=blocked_timeout,
-            connection_attempts=connection_attempts,
-            retry_delay=retry_delay,
-            socket_timeout=socket_timeout,            
+            connection_attempts=1,
+            retry_delay=0,
+            socket_timeout=socket_timeout,
+            stack_timeout=stack_timeout,
             credentials=credentials,
         )
 
@@ -111,7 +111,7 @@ class RabbitMQHelper:
     def _exit_application(cls, exc: BaseException | None = None) -> None:
         message = "RabbitMQ connection failed after configured retries. Exiting application with code 99."
         if exc is not None:
-            Logging.error("%s Root cause: %s", message, exc)
+            Logging.error_context(message, root_cause=str(exc))
         else:
             Logging.error(message)
         raise RabbitMQShutdownRequested(message)
@@ -149,23 +149,25 @@ class RabbitMQHelper:
 
         for attempt in range(1, retry_count + 1):
             try:
-                Logging.info(
-                    "RabbitMQ connection attempt %s of %s to %s:%s.",
-                    attempt,
-                    retry_count,
-                    host,
-                    port,
+                Logging.info_context(
+                    "RabbitMQ connection attempt started.",
+                    attempt=attempt,
+                    retry_count=retry_count,
+                    host=host,
+                    port=port,
                 )
                 cls._open_connection()
                 return
             except Exception as exc:
                 last_error = exc
                 cls.close()
-                Logging.error(
-                    "RabbitMQ connection attempt %s of %s failed: %s",
-                    attempt,
-                    retry_count,
-                    exc,
+                Logging.error_context(
+                    "RabbitMQ connection attempt failed.",
+                    attempt=attempt,
+                    retry_count=retry_count,
+                    host=host,
+                    port=port,
+                    error=str(exc),
                 )
                 if attempt < retry_count:
                     time.sleep(retry_delay)
@@ -264,12 +266,13 @@ class RabbitMQHelper:
                 last_error = exc
                 should_retry = attempt < retry_count and cls._is_recoverable_connection_error(exc)
                 cls.close()
-                Logging.error(
-                    "RabbitMQ %s attempt %s of %s failed: %s",
-                    operation_name,
-                    attempt,
-                    retry_count,
-                    exc,
+                Logging.error_context(
+                    "RabbitMQ operation failed.",
+                    operation_name=operation_name,
+                    attempt=attempt,
+                    retry_count=retry_count,
+                    error=str(exc),
+                    recoverable=should_retry,
                 )
                 if not should_retry:
                     raise
@@ -280,7 +283,15 @@ class RabbitMQHelper:
         raise RuntimeError(f"RabbitMQ {operation_name} failed without an explicit error.")
 
     @classmethod
-    def send_p2p_message(cls, queue_name: str, message: Any) -> bool:
+    def send_p2p_message(
+        cls,
+        queue_name: str,
+        message: Any,
+        *,
+        correlation_id: str | None = None,
+        message_id: str | None = None,
+        headers: dict[str, Any] | None = None,
+    ) -> bool:
         """Send a point-to-point message to a queue. Queue is created if missing."""
         durable_queue = cls._as_bool(ConfigLoader.get("OFTL_RABITMQ_QUEUE_DURABLE", "true"), True)
         persistent_message = cls._as_bool(ConfigLoader.get("OFTL_RABITMQ_MESSAGE_PERSISTENT", "true"), True)
@@ -296,6 +307,9 @@ class RabbitMQHelper:
                 content_type=content_type,
                 content_encoding="utf-8",
                 delivery_mode=2 if persistent_message else 1,
+                correlation_id=correlation_id,
+                message_id=message_id,
+                headers=headers,
             )
 
             return bool(
@@ -317,6 +331,10 @@ class RabbitMQHelper:
         routing_key: str,
         message: Any,
         exchange_type: str | None = None,
+        *,
+        correlation_id: str | None = None,
+        message_id: str | None = None,
+        headers: dict[str, Any] | None = None,
     ) -> bool:
         """Publish a message to an exchange + routing key."""
         resolved_exchange_type = exchange_type or str(ConfigLoader.get("OFTL_RABITMQ_EXCHANGE_TYPE", "direct"))
@@ -338,6 +356,9 @@ class RabbitMQHelper:
                 content_type=content_type,
                 content_encoding="utf-8",
                 delivery_mode=2 if persistent_message else 1,
+                correlation_id=correlation_id,
+                message_id=message_id,
+                headers=headers,
             )
 
             return bool(

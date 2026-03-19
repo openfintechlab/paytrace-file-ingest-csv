@@ -185,35 +185,82 @@ def test_stream_process_csv_uses_file_header_for_legacy_column_layout(watcher_ag
 
     observed: dict[str, object] = {}
 
-    def _capture(row_payload, row_number, _file_path):
+    def _capture(row_payload, row_number, _file_path, *, file_id=None):
         observed["row_payload"] = row_payload
         observed["row_number"] = row_number
+        observed["file_id"] = file_id
 
     monkeypatch.setattr(watcher_agent, "_process_csv_row", _capture)
-    monkeypatch.setattr(watcher_agent, "_checkpoint_upsert", lambda *_args, **_kwargs: None)
+    checkpoints: list[int] = []
+    monkeypatch.setattr(watcher_agent, "_checkpoint_upsert", lambda _file_id, row_number: checkpoints.append(row_number))
 
     processed_rows = watcher_agent._stream_process_csv(csv_file, "file-123", resume_row=0)
 
     assert processed_rows == 2
     assert observed["row_number"] == 2
+    assert observed["file_id"] == "file-123"
     assert observed["row_payload"]["remittance_reference"] == "INV-7843"
     assert observed["row_payload"]["remittance_unstructured"] == "Invoice 7843 - office supplies"
     assert "intermediary_bank_bic" not in observed["row_payload"]
+    assert checkpoints == [2]
 
 
 def test_process_csv_row_reraises_rabbitmq_publish_errors(watcher_agent, monkeypatch, tmp_path):
     file_path = tmp_path / "failed.csv"
-    parsed_payment = SimpleNamespace(transfer_type="DOMESTIC")
+    parsed_payment = SimpleNamespace(transfer_type="DOMESTIC", transfer_id="PTX-ERR-1")
 
     monkeypatch.setattr(watcher_agent._payment_processor, "process_row", lambda _row: parsed_payment)
+    monkeypatch.setattr(watcher_agent, "_row_dispatch_get", lambda _transfer_id: None)
+    monkeypatch.setattr(watcher_agent, "_row_dispatch_mark_failed", lambda **_kwargs: None)
     monkeypatch.setattr(
         file_watcher_module.RabbitMQHelper,
         "send_p2p_message",
-        lambda _queue_name, _message: (_ for _ in ()).throw(RuntimeError("broker unavailable")),
+        lambda _queue_name, _message, **_kwargs: (_ for _ in ()).throw(RuntimeError("broker unavailable")),
     )
 
     with pytest.raises(RuntimeError, match="broker unavailable"):
-        watcher_agent._process_csv_row({"transfer_type": "DOMESTIC"}, 2, file_path)
+        watcher_agent._process_csv_row({"transfer_type": "DOMESTIC", "transfer_id": "PTX-ERR-1"}, 2, file_path, file_id="file-123")
+
+
+def test_process_csv_row_skips_already_published_transfer(monkeypatch, watcher_agent, tmp_path):
+    file_path = tmp_path / "already-published.csv"
+    parsed_payment = SimpleNamespace(transfer_type="DOMESTIC", transfer_id="PTX-001")
+    send_calls: list[str] = []
+
+    monkeypatch.setattr(watcher_agent._payment_processor, "process_row", lambda _row: parsed_payment)
+    monkeypatch.setattr(watcher_agent, "_row_dispatch_get", lambda _transfer_id: {"status": "published"})
+    monkeypatch.setattr(watcher_agent, "_row_dispatch_mark_published", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("should not record again")))
+    monkeypatch.setattr(
+        file_watcher_module.RabbitMQHelper,
+        "send_p2p_message",
+        lambda _queue_name, _message, **_kwargs: send_calls.append("sent"),
+    )
+
+    watcher_agent._process_csv_row({"transfer_type": "DOMESTIC", "transfer_id": "PTX-001"}, 2, file_path, file_id="file-123")
+
+    assert send_calls == []
+
+
+def test_validate_dependencies_fails_fast_when_database_is_unavailable(monkeypatch, watcher_agent):
+    monkeypatch.setattr(file_watcher_module.DBHelper, "initialize_connection", classmethod(lambda cls: False))
+
+    with pytest.raises(RuntimeError, match="Database is required"):
+        watcher_agent._validate_dependencies()
+
+
+def test_validate_dependencies_requires_all_tables(monkeypatch, watcher_agent):
+    monkeypatch.setattr(file_watcher_module.DBHelper, "initialize_connection", classmethod(lambda cls: True))
+
+    def _fake_select(_query, params=None):
+        qualified_name = params["qualified_name"]
+        if qualified_name.endswith("oftl_fwcsv_row_dispatch"):
+            return [{"relation_name": None}]
+        return [{"relation_name": qualified_name}]
+
+    monkeypatch.setattr(file_watcher_module.DBHelper, "execute_select", staticmethod(_fake_select))
+
+    with pytest.raises(RuntimeError, match="oftl_fwcsv_row_dispatch"):
+        watcher_agent._validate_required_tables()
 
 
 def test_process_claimed_with_lock_skips_duplicate_active_path(watcher_agent, monkeypatch, tmp_path):

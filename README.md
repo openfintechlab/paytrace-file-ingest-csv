@@ -37,7 +37,8 @@ tests/
 
 - Python 3.11+
 - `uv` installed
-- PostgreSQL (only required when DB operations are used)
+- PostgreSQL
+- RabbitMQ
 
 ## Quick Start
 
@@ -60,6 +61,8 @@ uv sync
 ```bash
 uv run python src/main.py
 ```
+
+The service validates RabbitMQ connectivity during startup. If RabbitMQ remains unavailable after the configured retry budget, the process exits with status code `99`.
 
 ## File Processing Flow
 
@@ -131,7 +134,6 @@ uv run python src/main.py
 - `OFTL_RABITMQ_CONN_RETRYCOUNT` (legacy fallback) - Used only when `OFTL_RABITMQ_CONNECTION_ATTEMPTS` is not set
 - `OFTL_RABITMQ_RETRY_DELAY` (default: `2`)
 - `OFTL_RABITMQ_SOCKET_TIMEOUT` (default: `5`)
-- `OFTL_RABITMQ_STACK_TIMEOUT` (default: `10`)
 - `OFTL_RABITMQ_QUEUE_DURABLE` (default: `true`)
 - `OFTL_RABITMQ_EXCHANGE_DURABLE` (default: `true`)
 - `OFTL_RABITMQ_EXCHANGE_TYPE` (default: `direct`)
@@ -140,14 +142,22 @@ uv run python src/main.py
 - `OFTL_RABITMQ_DOEMSTIC_REQUEST_QUEUE` (default: `CSV.PAYMENTS.DOMESTIC.REQ`) — Queue name for domestic payment transfer requests
 - `OFTL_RABITMQ_CROSS_BORDER_REQUEST_QUEUE` (default: `CSV.PAYMENTS.CROSS_BORDER.REQ`) — Queue name for cross-border payment transfer requests
 
-On startup, and again after a lost RabbitMQ connection during publish, the worker attempts to connect to RabbitMQ up to `OFTL_RABITMQ_CONNECTION_ATTEMPTS` times. Each helper retry performs a single broker dial so the process does not hang inside nested Pika retries. If all attempts fail, the process exits with status code `99`.
+On startup, the helper validates RabbitMQ connectivity and exits the process with status code `99` if the broker remains unavailable after the configured retries.
+
+During runtime, if RabbitMQ is lost while publishing:
+
+- the helper retries queue or exchange publish operations up to `OFTL_RABITMQ_CONNECTION_ATTEMPTS`
+- reconnect attempts use `OFTL_RABITMQ_HOST`, `OFTL_RABITMQ_PORT`, and `OFTL_RABITMQ_RETRY_DELAY`
+- if RabbitMQ remains unavailable after the retry budget, the helper raises a shutdown signal and the service exits with status code `99`
 
 ## Database Objects
 
-On startup, the service currently auto-creates:
+The service depends on these tables for idempotency and checkpointing:
 
 - `oftl_fwcsv_registry` (file-level processing state and checksums)
 - `oftl_fwcsv_checkpoint` (resume row checkpoints)
+
+The current code does not auto-create these tables at startup. Provision them before running the worker.
 
 ## Using DBHelper
 
@@ -175,7 +185,7 @@ Run `uv sync` first to ensure all dependencies are available in the project envi
 - `test_config_loader.py` — Configuration loading and environment variable resolution
 - `test_file_watcher.py` — File watcher scanning, claiming, and processing logic  
 - `test_payment_model.py` — Payment model validation, type coercion, and CSV parsing
-- `test_rabbitmq_helper.py` — RabbitMQ retry limits and startup connection handling
+- `test_rabbitmq_helper.py` — RabbitMQ retry limits, reconnect-after-loss behavior, and shutdown signaling
 
 ## CSV File Format
 
@@ -237,6 +247,31 @@ PTX-0000002,CROSS_BORDER,2026-03-03T10:20:00Z,2026-03-04,1200.00,USD,INVC,SHAR,3
       row_number BIGINT NOT NULL DEFAULT 0,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )
+
+ CREATE TABLE IF NOT EXISTS oftl_fwcsv_row_dispatch (
+     transfer_id VARCHAR(36) PRIMARY KEY,
+     file_id VARCHAR(128) NOT NULL,
+     row_number BIGINT NOT NULL,
+     request_queue TEXT NOT NULL,
+     status VARCHAR(32) NOT NULL,
+     published_at TIMESTAMPTZ NULL,
+     error_message TEXT NULL,
+     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ );
+
+ CREATE INDEX IF NOT EXISTS idx_oftl_fwcsv_row_dispatch_file_id
+    ON oftl_fwcsv_row_dispatch (file_id);
+
+CREATE INDEX IF NOT EXISTS idx_oftl_fwcsv_row_dispatch_status
+    ON oftl_fwcsv_row_dispatch (status);
+
+CREATE INDEX IF NOT EXISTS idx_oftl_fwcsv_row_dispatch_updated_at
+    ON oftl_fwcsv_row_dispatch (updated_at);
+
+ALTER TABLE oftl_fwcsv_row_dispatch
+    ADD CONSTRAINT chk_oftl_fwcsv_row_dispatch_status
+    CHECK (status IN ('published', 'failed'));
+
 ```
 
 ## Major Libraries Used
