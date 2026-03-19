@@ -229,6 +229,7 @@ PTX-0000002,CROSS_BORDER,2026-03-03T10:20:00Z,2026-03-04,1200.00,USD,INVC,SHAR,3
 ### Table Structure
 
 ``` sql
+DROP TABLE IF EXISTS oftl_fwcsv_registry;
  CREATE TABLE IF NOT EXISTS oftl_fwcsv_registry (
                 file_id VARCHAR(128) PRIMARY KEY,
                 filename TEXT NOT NULL,
@@ -242,13 +243,15 @@ PTX-0000002,CROSS_BORDER,2026-03-03T10:20:00Z,2026-03-04,1200.00,USD,INVC,SHAR,3
                 ended_at TIMESTAMPTZ,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
-  CREATE TABLE IF NOT EXISTS oftl_fwcsv_checkpoint (
-      file_id VARCHAR(128) PRIMARY KEY,
-      row_number BIGINT NOT NULL DEFAULT 0,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  )
+DROP TABLE IF EXISTS  oftl_fwcsv_checkpoint;
+CREATE TABLE IF NOT EXISTS oftl_fwcsv_checkpoint (
+    file_id VARCHAR(128) PRIMARY KEY,
+    row_number BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
- CREATE TABLE IF NOT EXISTS oftl_fwcsv_row_dispatch (
+DROP TABLE IF EXISTS   oftl_fwcsv_row_dispatch;
+CREATE TABLE IF NOT EXISTS oftl_fwcsv_row_dispatch (
      transfer_id VARCHAR(36) PRIMARY KEY,
      file_id VARCHAR(128) NOT NULL,
      row_number BIGINT NOT NULL,
@@ -270,7 +273,7 @@ CREATE INDEX IF NOT EXISTS idx_oftl_fwcsv_row_dispatch_updated_at
 
 ALTER TABLE oftl_fwcsv_row_dispatch
     ADD CONSTRAINT chk_oftl_fwcsv_row_dispatch_status
-    CHECK (status IN ('published', 'failed'));
+    CHECK (status IN ('published', 'failed', 'processed'));
 
 ```
 
