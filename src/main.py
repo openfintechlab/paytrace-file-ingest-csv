@@ -24,6 +24,15 @@ _DEFAULT_ROOT_DIR = "./fwcsv"
 
 
 def display_banner() -> None:
+    banner = r"""
+            ____                   _____       __            __    __          __  
+            / __ \____  ___  ____  / __(_)___  / /____  _____/ /_  / /   ____ _/ /_ 
+            / / / / __ \/ _ \/ __ \/ /_/ / __ \/ __/ _ \/ ___/ __ \/ /   / __ `/ __ \
+            / /_/ / /_/ /  __/ / / / __/ / / / / /_/  __/ /__/ / / / /___/ /_/ / /_/ /
+            \____/ .___/\___/_/ /_/_/ /_/_/ /_/\__/\___/\___/_/ /_/_____/\__,_/_.___/ 
+                /_/                                                                   
+            """
+    print(banner)
     Logging.info("===============================================")
     Logging.info("Starting PayTrace File Watcher")
     Logging.info("Version: %s", ConfigLoader.get("OFTL_SCA_VERSION", "N/A"))

@@ -104,6 +104,75 @@ def test_process_claimed_file_uses_checkpoint_resume_row(watcher_agent, monkeypa
     assert observed["checkpoint_deletes"] == 1
 
 
+def test_emit_processed_event_publishes_ev001_topic_message(watcher_agent, monkeypatch, tmp_path):
+    claimed = ClaimedFile(
+        source_name="payments.csv",
+        claimed_path=tmp_path / "processing" / "payments.csv",
+        fingerprint="file-123",
+        size=123,
+        mtime_ns=456,
+    )
+    archive_path = tmp_path / "archive" / "payments.20260425T130533Z.csv"
+    started_at = real_datetime(2026, 4, 25, 13, 5, 33, 135320, tzinfo=timezone.utc)
+    ended_at = real_datetime(2026, 4, 25, 13, 5, 33, 552729, tzinfo=timezone.utc)
+    published: dict[str, object] = {}
+
+    def _fake_get(cls, key, default=None):
+        overrides = {
+            "OFTL_RABITMQ_PUBEVENT_EV001": "files.csv.loaded",
+            "OFTL_RABITMQ_PUBEVENT_EXCHANGE": "paytrace.events",
+        }
+        return overrides.get(key, default)
+
+    def _capture_publish(exchange_name, routing_key, message, exchange_type=None, **kwargs):
+        published["exchange_name"] = exchange_name
+        published["routing_key"] = routing_key
+        published["message"] = message
+        published["exchange_type"] = exchange_type
+        published["kwargs"] = kwargs
+        return True
+
+    monkeypatch.setattr(ConfigLoader, "get", classmethod(_fake_get))
+    monkeypatch.setattr(file_watcher_module.uuid, "uuid4", lambda: "event-123")
+    monkeypatch.setattr(file_watcher_module.RabbitMQHelper, "publish_message", _capture_publish)
+
+    watcher_agent._emit_processed_event(
+        claimed,
+        archive_path,
+        row_count=6,
+        checksum="checksum-123",
+        started_at=started_at,
+        ended_at=ended_at,
+    )
+
+    assert published["exchange_name"] == "paytrace.events"
+    assert published["routing_key"] == "files.csv.loaded"
+    assert published["exchange_type"] == "topic"
+    event = published["message"]
+    assert event["event_id"] == "event-123"
+    assert event["event_code"] == "EV001"
+    assert event["event_type"] == "files.csv.loaded"
+    assert event["event_version"] == "1.0"
+    assert event["source"] == "paytrace-file-ingest-csv"
+    assert event["correlation_id"] == "checksum-123"
+    assert event["causation_id"] == "file-123"
+    assert event["payload"] == {
+        "event": "file_processed",
+        "file_id": "file-123",
+        "filename": "payments.csv",
+        "archive_path": str(archive_path),
+        "checksum_sha256": "checksum-123",
+        "row_count": 6,
+        "started_at": "2026-04-25T13:05:33.135320+00:00",
+        "ended_at": "2026-04-25T13:05:33.552729+00:00",
+    }
+    assert published["kwargs"] == {
+        "correlation_id": "checksum-123",
+        "message_id": "event-123",
+        "headers": {"event_code": "EV001", "file_id": "file-123"},
+    }
+
+
 def test_move_to_archive_creates_date_partitioned_path(watcher_agent, monkeypatch):
     source = watcher_agent.processing_dir / "sample.csv"
     source.write_text("a,b\n1,2\n", encoding="utf-8")

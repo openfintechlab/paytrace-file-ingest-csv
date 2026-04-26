@@ -8,6 +8,7 @@ import csv
 import hashlib
 import json
 import os
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -760,14 +761,42 @@ class FileWatcherAgent:
         started_at: datetime,
         ended_at: datetime,
     ) -> None:
-        payload = {
-            "event": "file_processed",
-            "file_id": claimed.fingerprint,
-            "filename": claimed.source_name,
-            "archive_path": str(archive_path),
-            "checksum_sha256": checksum,
-            "row_count": row_count,
-            "started_at": started_at.isoformat(),
-            "ended_at": ended_at.isoformat(),
+        routing_key = str(ConfigLoader.get("OFTL_RABITMQ_PUBEVENT_EV001", "files.csv.loaded")).strip()
+        if not routing_key:
+            raise ValueError("OFTL_RABITMQ_PUBEVENT_EV001 must be configured for EV001 publishing.")
+
+        event_id = str(uuid.uuid4())
+        event = {
+            "event_id": event_id,
+            "event_code": "EV001",
+            "event_type": routing_key,
+            "event_version": "1.0",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "paytrace-file-ingest-csv",
+            "correlation_id": checksum,
+            "causation_id": claimed.fingerprint,
+            "payload": {
+                "event": "file_processed",
+                "file_id": claimed.fingerprint,
+                "filename": claimed.source_name,
+                "archive_path": str(archive_path),
+                "checksum_sha256": checksum,
+                "row_count": row_count,
+                "started_at": started_at.isoformat(),
+                "ended_at": ended_at.isoformat(),
+            },
         }
-        Logging.info("%s", json.dumps(payload, separators=(",", ":")))
+        exchange_name = str(ConfigLoader.get("OFTL_RABITMQ_PUBEVENT_EXCHANGE", "paytrace.events")).strip()
+        if not exchange_name:
+            raise ValueError("OFTL_RABITMQ_PUBEVENT_EXCHANGE must be configured for EV001 publishing.")
+
+        RabbitMQHelper.publish_message(
+            exchange_name,
+            routing_key,
+            event,
+            exchange_type="topic",
+            correlation_id=checksum,
+            message_id=event_id,
+            headers={"event_code": "EV001", "file_id": claimed.fingerprint},
+        )
+        Logging.info(f"Event with ID: {event_id} and code: {event['event_code']} published to topic: {routing_key} ")

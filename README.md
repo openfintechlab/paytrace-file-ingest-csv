@@ -9,7 +9,7 @@ This project provides a production-style CSV ingest worker for PayTrace, plus sh
 - PostgreSQL connection and query helpers using SQLAlchemy (`DBHelper`)
 - CSV file watcher + scanner with claim/checkpoint/idempotency/archive semantics (`FileWatcherAgent`)
 - JSON Schema driven payment instruction validation, typing, and CSV column mapping (`src/domain/payment_instruction.schema.json`)
-- A startup entrypoint (`src/main.py`) that starts the watcher service
+- A startup entrypoint (`src/main.py`) that prints the service banner, validates RabbitMQ connectivity, and starts the watcher service
 
 ## Project Structure
 
@@ -69,9 +69,11 @@ The service validates RabbitMQ connectivity during startup. If RabbitMQ remains 
 1. Watches `OFTL_FWCSV_ROOTDIR/inbox` for `.csv` files (also performs periodic scans).
 2. Waits for file stability, then atomically moves the file to `processing/`.
 3. Streams CSV rows and skips the header row.
-4. Persists processing state in DB for idempotency and resume support.
-5. Moves successful files to date-partitioned `archive/YYYY/MM/DD/`.
-6. Moves failed files to `error/`.
+4. Publishes each valid payment row to the configured domestic or cross-border RabbitMQ request queue.
+5. Persists processing state in DB for idempotency, resume support, and row dispatch status.
+6. Moves successful files to date-partitioned `archive/YYYY/MM/DD/`.
+7. Publishes an EV001 file-loaded event to the configured RabbitMQ topic exchange.
+8. Moves failed files to `error/`.
 
 `FileWatcher.py::_process_csv_row(...)` is the integration point for project-specific business logic.
 
@@ -134,9 +136,12 @@ The service validates RabbitMQ connectivity during startup. If RabbitMQ remains 
 - `OFTL_RABITMQ_CONN_RETRYCOUNT` (legacy fallback) - Used only when `OFTL_RABITMQ_CONNECTION_ATTEMPTS` is not set
 - `OFTL_RABITMQ_RETRY_DELAY` (default: `2`)
 - `OFTL_RABITMQ_SOCKET_TIMEOUT` (default: `5`)
+- `OFTL_RABITMQ_STACK_TIMEOUT` (default: `10`)
 - `OFTL_RABITMQ_QUEUE_DURABLE` (default: `true`)
 - `OFTL_RABITMQ_EXCHANGE_DURABLE` (default: `true`)
 - `OFTL_RABITMQ_EXCHANGE_TYPE` (default: `direct`)
+- `OFTL_RABITMQ_PUBEVENT_EXCHANGE` (default: `paytrace.events`) — Topic exchange for file lifecycle events
+- `OFTL_RABITMQ_PUBEVENT_EV001` (default: `files.csv.loaded`) — Routing key for EV001 file loaded events
 - `OFTL_RABITMQ_MESSAGE_PERSISTENT` (default: `true`)
 - `OFTL_RABITMQ_PUBLISH_MANDATORY` (default: `false`)
 - `OFTL_RABITMQ_DOEMSTIC_REQUEST_QUEUE` (default: `CSV.PAYMENTS.DOMESTIC.REQ`) — Queue name for domestic payment transfer requests
@@ -150,27 +155,49 @@ During runtime, if RabbitMQ is lost while publishing:
 - reconnect attempts use `OFTL_RABITMQ_HOST`, `OFTL_RABITMQ_PORT`, and `OFTL_RABITMQ_RETRY_DELAY`
 - if RabbitMQ remains unavailable after the retry budget, the helper raises a shutdown signal and the service exits with status code `99`
 
+### Published Messages
+
+For each parsed payment row, the worker publishes the schema-driven payment payload to:
+
+- `OFTL_RABITMQ_DOEMSTIC_REQUEST_QUEUE` when `transfer_type` is `DOMESTIC`
+- `OFTL_RABITMQ_CROSS_BORDER_REQUEST_QUEUE` when `transfer_type` is `CROSS_BORDER`
+
+After a file is fully processed, archived, and marked completed in `oftl_fwcsv_registry`, the worker publishes EV001 to `OFTL_RABITMQ_PUBEVENT_EXCHANGE` as a RabbitMQ `topic` exchange message. The routing key comes from `OFTL_RABITMQ_PUBEVENT_EV001` and defaults to `files.csv.loaded`.
+
+EV001 envelope:
+
+```json
+{
+  "event_id": "generated UUID",
+  "event_code": "EV001",
+  "event_type": "files.csv.loaded",
+  "event_version": "1.0",
+  "timestamp": "UTC ISO-8601 timestamp",
+  "source": "paytrace-file-ingest-csv",
+  "correlation_id": "file checksum_sha256",
+  "causation_id": "file_id",
+  "payload": {
+    "event": "file_processed",
+    "file_id": "file fingerprint",
+    "filename": "original CSV filename",
+    "archive_path": "archived file path",
+    "checksum_sha256": "file checksum_sha256",
+    "row_count": 6,
+    "started_at": "UTC ISO-8601 timestamp",
+    "ended_at": "UTC ISO-8601 timestamp"
+  }
+}
+```
+
 ## Database Objects
 
-The service depends on these tables for idempotency and checkpointing:
+The service depends on these tables for idempotency, checkpointing, and dispatch tracking:
 
 - `oftl_fwcsv_registry` (file-level processing state and checksums)
 - `oftl_fwcsv_checkpoint` (resume row checkpoints)
+- `oftl_fwcsv_row_dispatch` (per-transfer publish status and downstream processing status)
 
 The current code does not auto-create these tables at startup. Provision them before running the worker.
-
-## Using DBHelper
-
-`DBHelper` initializes a pooled SQLAlchemy engine and provides helper methods:
-
-- `initialize_connection()`
-- `dispose_connection()`
-- `execute_select(query, params=None)`
-- `execute_insert(query, params=None)`
-- `execute_update(query, params=None)`
-- `execute_delete(query, params=None)`
-
-The helper validates required DB environment variables, defaults `OFTL_POSTGRESDB_NAME` and `OFTL_POSTGRESDB_SCHEMA` to `public`, sets the PostgreSQL `search_path` from `OFTL_POSTGRESDB_SCHEMA`, and performs a connectivity check (`SELECT 1`) during initialization.
 
 ## Testing
 
