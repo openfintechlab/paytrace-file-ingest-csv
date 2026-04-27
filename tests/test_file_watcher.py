@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import importlib
 from threading import Event
 from datetime import datetime as real_datetime, timezone
 from pathlib import Path
@@ -11,6 +12,8 @@ import src.utilities.FileWatcher as file_watcher_module
 from src.utilities.ConfigLoader import ConfigLoader
 from src.utilities.FileWatcher import ClaimedFile, FileWatcherAgent
 from src.utilities.RabbitMQHelper import RabbitMQShutdownRequested
+
+csv_processor_module = importlib.import_module("src.domain.CSVFileProcessor")
 
 
 @pytest.fixture
@@ -68,6 +71,7 @@ def test_stability_window_requires_consecutive_unchanged_samples(watcher_agent, 
 
 
 def test_process_claimed_file_uses_checkpoint_resume_row(watcher_agent, monkeypatch, tmp_path):
+    processor = watcher_agent._csv_file_processor
     claimed = ClaimedFile(
         source_name="resume.csv",
         claimed_path=tmp_path / "processing" / "resume.csv",
@@ -78,33 +82,35 @@ def test_process_claimed_file_uses_checkpoint_resume_row(watcher_agent, monkeypa
 
     observed = {"resume_row": None, "checkpoint_deletes": 0}
 
-    monkeypatch.setattr(watcher_agent, "_compute_sha256_streaming", lambda _path: "checksum-1")
-    monkeypatch.setattr(watcher_agent, "_registry_get", lambda _file_id: {"status": "processing", "checksum_sha256": "checksum-1"})
-    monkeypatch.setattr(watcher_agent, "_registry_mark_started", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(watcher_agent, "_registry_mark_completed", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(watcher_agent, "_registry_mark_failed", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(watcher_agent, "_checkpoint_get", lambda _file_id: 7)
+    monkeypatch.setattr(processor, "_compute_sha256_streaming", lambda _path: "checksum-1")
+    monkeypatch.setattr(processor, "_registry_get", lambda _file_id: {"status": "processing", "checksum_sha256": "checksum-1"})
+    monkeypatch.setattr(processor, "_registry_mark_started", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(processor, "_registry_mark_completed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(processor, "_registry_mark_failed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(processor, "_checkpoint_get", lambda _file_id: 7)
 
     def _fake_stream(_path, _file_id, resume_row):
         observed["resume_row"] = resume_row
         return 11
 
-    monkeypatch.setattr(watcher_agent, "_stream_process_csv", _fake_stream)
+    monkeypatch.setattr(processor, "_stream_process_csv", _fake_stream)
 
     def _fake_checkpoint_delete(_file_id):
         observed["checkpoint_deletes"] += 1
 
-    monkeypatch.setattr(watcher_agent, "_checkpoint_delete", _fake_checkpoint_delete)
+    monkeypatch.setattr(processor, "_checkpoint_delete", _fake_checkpoint_delete)
     monkeypatch.setattr(watcher_agent, "_move_to_archive", lambda _path, suffix=None: watcher_agent.archive_dir / "archived.csv")
-    monkeypatch.setattr(watcher_agent, "_emit_processed_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(processor, "_archive_file", lambda _path, _suffix=None: watcher_agent.archive_dir / "archived.csv")
+    monkeypatch.setattr(processor, "_emit_processed_event", lambda *_args, **_kwargs: None)
 
-    watcher_agent._process_claimed_file(claimed)
+    processor.process_claimed_file(claimed)
 
     assert observed["resume_row"] == 7
     assert observed["checkpoint_deletes"] == 1
 
 
 def test_emit_processed_event_publishes_ev001_topic_message(watcher_agent, monkeypatch, tmp_path):
+    processor = watcher_agent._csv_file_processor
     claimed = ClaimedFile(
         source_name="payments.csv",
         claimed_path=tmp_path / "processing" / "payments.csv",
@@ -133,10 +139,10 @@ def test_emit_processed_event_publishes_ev001_topic_message(watcher_agent, monke
         return True
 
     monkeypatch.setattr(ConfigLoader, "get", classmethod(_fake_get))
-    monkeypatch.setattr(file_watcher_module.uuid, "uuid4", lambda: "event-123")
-    monkeypatch.setattr(file_watcher_module.RabbitMQHelper, "publish_message", _capture_publish)
+    monkeypatch.setattr(csv_processor_module.uuid, "uuid4", lambda: "event-123")
+    monkeypatch.setattr(csv_processor_module.RabbitMQHelper, "publish_message", _capture_publish)
 
-    watcher_agent._emit_processed_event(
+    processor._emit_processed_event(
         claimed,
         archive_path,
         row_count=6,
@@ -194,6 +200,7 @@ def test_move_to_archive_creates_date_partitioned_path(watcher_agent, monkeypatc
 
 
 def test_stream_process_csv_uses_file_header_for_legacy_column_layout(watcher_agent, monkeypatch, tmp_path):
+    processor = watcher_agent._csv_file_processor
     csv_file = tmp_path / "legacy.csv"
     with csv_file.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
@@ -259,11 +266,11 @@ def test_stream_process_csv_uses_file_header_for_legacy_column_layout(watcher_ag
         observed["row_number"] = row_number
         observed["file_id"] = file_id
 
-    monkeypatch.setattr(watcher_agent, "_process_csv_row", _capture)
+    monkeypatch.setattr(processor, "_process_csv_row", _capture)
     checkpoints: list[int] = []
-    monkeypatch.setattr(watcher_agent, "_checkpoint_upsert", lambda _file_id, row_number: checkpoints.append(row_number))
+    monkeypatch.setattr(processor, "_checkpoint_upsert", lambda _file_id, row_number: checkpoints.append(row_number))
 
-    processed_rows = watcher_agent._stream_process_csv(csv_file, "file-123", resume_row=0)
+    processed_rows = processor._stream_process_csv(csv_file, "file-123", resume_row=0)
 
     assert processed_rows == 2
     assert observed["row_number"] == 2
@@ -275,37 +282,39 @@ def test_stream_process_csv_uses_file_header_for_legacy_column_layout(watcher_ag
 
 
 def test_process_csv_row_reraises_rabbitmq_publish_errors(watcher_agent, monkeypatch, tmp_path):
+    processor = watcher_agent._csv_file_processor
     file_path = tmp_path / "failed.csv"
     parsed_payment = SimpleNamespace(transfer_type="DOMESTIC", transfer_id="PTX-ERR-1")
 
-    monkeypatch.setattr(watcher_agent._payment_processor, "process_row", lambda _row: parsed_payment)
-    monkeypatch.setattr(watcher_agent, "_row_dispatch_get", lambda _transfer_id: None)
-    monkeypatch.setattr(watcher_agent, "_row_dispatch_mark_failed", lambda **_kwargs: None)
+    monkeypatch.setattr(processor._payment_processor, "process_row", lambda _row: parsed_payment)
+    monkeypatch.setattr(processor, "_row_dispatch_get", lambda _transfer_id: None)
+    monkeypatch.setattr(processor, "_row_dispatch_mark_failed", lambda **_kwargs: None)
     monkeypatch.setattr(
-        file_watcher_module.RabbitMQHelper,
+        csv_processor_module.RabbitMQHelper,
         "send_p2p_message",
         lambda _queue_name, _message, **_kwargs: (_ for _ in ()).throw(RuntimeError("broker unavailable")),
     )
 
     with pytest.raises(RuntimeError, match="broker unavailable"):
-        watcher_agent._process_csv_row({"transfer_type": "DOMESTIC", "transfer_id": "PTX-ERR-1"}, 2, file_path, file_id="file-123")
+        processor._process_csv_row({"transfer_type": "DOMESTIC", "transfer_id": "PTX-ERR-1"}, 2, file_path, file_id="file-123")
 
 
 def test_process_csv_row_skips_already_published_transfer(monkeypatch, watcher_agent, tmp_path):
+    processor = watcher_agent._csv_file_processor
     file_path = tmp_path / "already-published.csv"
     parsed_payment = SimpleNamespace(transfer_type="DOMESTIC", transfer_id="PTX-001")
     send_calls: list[str] = []
 
-    monkeypatch.setattr(watcher_agent._payment_processor, "process_row", lambda _row: parsed_payment)
-    monkeypatch.setattr(watcher_agent, "_row_dispatch_get", lambda _transfer_id: {"status": "published"})
-    monkeypatch.setattr(watcher_agent, "_row_dispatch_mark_published", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("should not record again")))
+    monkeypatch.setattr(processor._payment_processor, "process_row", lambda _row: parsed_payment)
+    monkeypatch.setattr(processor, "_row_dispatch_get", lambda _transfer_id: {"status": "published"})
+    monkeypatch.setattr(processor, "_row_dispatch_mark_published", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("should not record again")))
     monkeypatch.setattr(
-        file_watcher_module.RabbitMQHelper,
+        csv_processor_module.RabbitMQHelper,
         "send_p2p_message",
         lambda _queue_name, _message, **_kwargs: send_calls.append("sent"),
     )
 
-    watcher_agent._process_csv_row({"transfer_type": "DOMESTIC", "transfer_id": "PTX-001"}, 2, file_path, file_id="file-123")
+    processor._process_csv_row({"transfer_type": "DOMESTIC", "transfer_id": "PTX-001"}, 2, file_path, file_id="file-123")
 
     assert send_calls == []
 
