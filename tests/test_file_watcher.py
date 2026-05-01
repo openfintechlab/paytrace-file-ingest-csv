@@ -109,6 +109,39 @@ def test_process_claimed_file_uses_checkpoint_resume_row(watcher_agent, monkeypa
     assert observed["checkpoint_deletes"] == 1
 
 
+def test_process_claimed_file_emits_ev001_error_for_idempotency_skip(watcher_agent, monkeypatch, tmp_path):
+    processor = watcher_agent._csv_file_processor
+    claimed = ClaimedFile(
+        source_name="duplicate.csv",
+        claimed_path=tmp_path / "processing" / "duplicate.csv",
+        fingerprint="file-123",
+        size=123,
+        mtime_ns=456,
+    )
+    archive_path = tmp_path / "archive" / "duplicate.duplicate.csv"
+    emitted_events: list[dict[str, object]] = []
+    archive_calls: list[tuple[Path, str | None]] = []
+
+    monkeypatch.setattr(processor, "_compute_sha256_streaming", lambda _path: "checksum-1")
+    monkeypatch.setattr(
+        processor,
+        "_registry_get",
+        lambda _file_id: {"status": "completed", "checksum_sha256": "checksum-1", "row_count": 6},
+    )
+    monkeypatch.setattr(processor, "_archive_file", lambda path, suffix=None: archive_calls.append((path, suffix)) or archive_path)
+    monkeypatch.setattr(processor, "_registry_mark_started", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not restart")))
+    monkeypatch.setattr(processor, "_stream_process_csv", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not reprocess")))
+    monkeypatch.setattr(processor, "_emit_processed_event", lambda *args, **kwargs: emitted_events.append({"args": args, "kwargs": kwargs}))
+
+    processor.process_claimed_file(claimed)
+
+    assert archive_calls == [(claimed.claimed_path, "duplicate")]
+    assert len(emitted_events) == 1
+    event_call = emitted_events[0]
+    assert event_call["args"][:4] == (claimed, archive_path, 6, "checksum-1")
+    assert event_call["kwargs"] == {"status": "error", "error_message": "Idempotency"}
+
+
 def test_emit_processed_event_publishes_ev001_topic_message(watcher_agent, monkeypatch, tmp_path):
     processor = watcher_agent._csv_file_processor
     claimed = ClaimedFile(
@@ -176,6 +209,135 @@ def test_emit_processed_event_publishes_ev001_topic_message(watcher_agent, monke
         "correlation_id": "checksum-123",
         "message_id": "event-123",
         "headers": {"event_code": "EV001", "file_id": "file-123"},
+    }
+
+
+def test_emit_processed_event_publishes_ev001_error_status(watcher_agent, monkeypatch, tmp_path):
+    processor = watcher_agent._csv_file_processor
+    claimed = ClaimedFile(
+        source_name="payments.csv",
+        claimed_path=tmp_path / "processing" / "payments.csv",
+        fingerprint="file-123",
+        size=123,
+        mtime_ns=456,
+    )
+    archive_path = tmp_path / "archive" / "payments.duplicate.csv"
+    event_ts = real_datetime(2026, 4, 25, 13, 5, 33, 135320, tzinfo=timezone.utc)
+    published: dict[str, object] = {}
+
+    def _fake_get(cls, key, default=None):
+        overrides = {
+            "OFTL_RABITMQ_PUBEVENT_EV001": "files.csv.loaded",
+            "OFTL_RABITMQ_PUBEVENT_EXCHANGE": "paytrace.events",
+        }
+        return overrides.get(key, default)
+
+    def _capture_publish(exchange_name, routing_key, message, exchange_type=None, **kwargs):
+        published["exchange_name"] = exchange_name
+        published["routing_key"] = routing_key
+        published["message"] = message
+        published["exchange_type"] = exchange_type
+        published["kwargs"] = kwargs
+        return True
+
+    monkeypatch.setattr(ConfigLoader, "get", classmethod(_fake_get))
+    monkeypatch.setattr(csv_processor_module.uuid, "uuid4", lambda: "event-123")
+    monkeypatch.setattr(csv_processor_module.RabbitMQHelper, "publish_message", _capture_publish)
+
+    processor._emit_processed_event(
+        claimed,
+        archive_path,
+        row_count=6,
+        checksum="checksum-123",
+        started_at=event_ts,
+        ended_at=event_ts,
+        status="error",
+        error_message="Idempotency",
+    )
+
+    assert published["exchange_name"] == "paytrace.events"
+    assert published["routing_key"] == "files.csv.loaded"
+    assert published["exchange_type"] == "topic"
+    event = published["message"]
+    assert event["event_code"] == "EV001"
+    assert event["event_type"] == "files.csv.loaded"
+    assert event["payload"] == {
+        "event": "file_processed",
+        "file_id": "file-123",
+        "filename": "payments.csv",
+        "archive_path": str(archive_path),
+        "checksum_sha256": "checksum-123",
+        "row_count": 6,
+        "started_at": "2026-04-25T13:05:33.135320+00:00",
+        "ended_at": "2026-04-25T13:05:33.135320+00:00",
+        "status": "error",
+        "error_message": "Idempotency",
+    }
+    assert published["kwargs"] == {
+        "correlation_id": "checksum-123",
+        "message_id": "event-123",
+        "headers": {"event_code": "EV001", "file_id": "file-123"},
+    }
+
+
+def test_emit_row_failed_event_publishes_ev002_topic_message(watcher_agent, monkeypatch, tmp_path):
+    processor = watcher_agent._csv_file_processor
+    file_path = tmp_path / "processing" / "payments.csv"
+    published: dict[str, object] = {}
+    uuid_values = iter(["event-456", "correlation-789"])
+
+    def _fake_get(cls, key, default=None):
+        overrides = {
+            "OFTL_RABITMQ_PUBEVENT_EV002": "files.csv.row.failed",
+            "OFTL_RABITMQ_PUBEVENT_EXCHANGE": "paytrace.events",
+        }
+        return overrides.get(key, default)
+
+    def _capture_publish(exchange_name, routing_key, message, exchange_type=None, **kwargs):
+        published["exchange_name"] = exchange_name
+        published["routing_key"] = routing_key
+        published["message"] = message
+        published["exchange_type"] = exchange_type
+        published["kwargs"] = kwargs
+        return True
+
+    monkeypatch.setattr(ConfigLoader, "get", classmethod(_fake_get))
+    monkeypatch.setattr(csv_processor_module.uuid, "uuid4", lambda: next(uuid_values))
+    monkeypatch.setattr(csv_processor_module.RabbitMQHelper, "publish_message", _capture_publish)
+
+    processor._emit_row_failed_event(
+        transfer_id="PTX-ERR-1",
+        file_id="file-123",
+        row_number=2,
+        file_path=file_path,
+        error_message="validation failed",
+        failure_reason="row_processing_failed",
+    )
+
+    assert published["exchange_name"] == "paytrace.events"
+    assert published["routing_key"] == "files.csv.row.failed"
+    assert published["exchange_type"] == "topic"
+    event = published["message"]
+    assert event["event_id"] == "event-456"
+    assert event["event_code"] == "EV002"
+    assert event["event_type"] == "files.csv.row.failed"
+    assert event["event_version"] == "1.0"
+    assert event["source"] == "paytrace-file-ingest-csv"
+    assert event["correlation_id"] == "correlation-789"
+    assert event["causation_id"] == "PTX-ERR-1"
+    assert event["payload"] == {
+        "event": "row_failed",
+        "file_id": "file-123",
+        "filename": "payments.csv",
+        "row_number": 2,
+        "transfer_id": "PTX-ERR-1",
+        "failure_reason": "row_processing_failed",
+        "error_message": "validation failed",
+    }
+    assert published["kwargs"] == {
+        "correlation_id": "correlation-789",
+        "message_id": "event-456",
+        "headers": {"event_code": "EV002", "file_id": "file-123", "row_number": 2},
     }
 
 
@@ -289,6 +451,7 @@ def test_process_csv_row_reraises_rabbitmq_publish_errors(watcher_agent, monkeyp
     monkeypatch.setattr(processor._payment_processor, "process_row", lambda _row: parsed_payment)
     monkeypatch.setattr(processor, "_row_dispatch_get", lambda _transfer_id: None)
     monkeypatch.setattr(processor, "_row_dispatch_mark_failed", lambda **_kwargs: None)
+    monkeypatch.setattr(processor, "_emit_row_failed_event", lambda **_kwargs: None)
     monkeypatch.setattr(
         csv_processor_module.RabbitMQHelper,
         "send_p2p_message",
@@ -304,10 +467,12 @@ def test_process_csv_row_skips_already_published_transfer(monkeypatch, watcher_a
     file_path = tmp_path / "already-published.csv"
     parsed_payment = SimpleNamespace(transfer_type="DOMESTIC", transfer_id="PTX-001")
     send_calls: list[str] = []
+    emitted_events: list[dict[str, object]] = []
 
     monkeypatch.setattr(processor._payment_processor, "process_row", lambda _row: parsed_payment)
     monkeypatch.setattr(processor, "_row_dispatch_get", lambda _transfer_id: {"status": "published"})
     monkeypatch.setattr(processor, "_row_dispatch_mark_published", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("should not record again")))
+    monkeypatch.setattr(processor, "_emit_row_failed_event", lambda **kwargs: emitted_events.append(kwargs))
     monkeypatch.setattr(
         csv_processor_module.RabbitMQHelper,
         "send_p2p_message",
@@ -317,6 +482,44 @@ def test_process_csv_row_skips_already_published_transfer(monkeypatch, watcher_a
     processor._process_csv_row({"transfer_type": "DOMESTIC", "transfer_id": "PTX-001"}, 2, file_path, file_id="file-123")
 
     assert send_calls == []
+    assert emitted_events == [
+        {
+            "transfer_id": "PTX-001",
+            "file_id": "file-123",
+            "row_number": 2,
+            "file_path": file_path,
+            "error_message": "Row rejected because transfer signature was already published.",
+            "failure_reason": "redundant_signature",
+        }
+    ]
+
+
+def test_process_csv_row_emits_ev002_for_processing_failure(watcher_agent, monkeypatch, tmp_path):
+    processor = watcher_agent._csv_file_processor
+    file_path = tmp_path / "failed.csv"
+    emitted_events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        processor._payment_processor,
+        "process_row",
+        lambda _row: (_ for _ in ()).throw(ValueError("invalid amount")),
+    )
+    monkeypatch.setattr(processor, "_row_dispatch_mark_failed", lambda **_kwargs: None)
+    monkeypatch.setattr(processor, "_emit_row_failed_event", lambda **kwargs: emitted_events.append(kwargs))
+
+    with pytest.raises(ValueError, match="invalid amount"):
+        processor._process_csv_row({"transfer_id": "PTX-ERR-2"}, 3, file_path, file_id="file-456")
+
+    assert emitted_events == [
+        {
+            "transfer_id": "PTX-ERR-2",
+            "file_id": "file-456",
+            "row_number": 3,
+            "file_path": file_path,
+            "error_message": "invalid amount",
+            "failure_reason": "row_processing_failed",
+        }
+    ]
 
 
 def test_validate_dependencies_fails_fast_when_database_is_unavailable(monkeypatch, watcher_agent):

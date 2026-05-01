@@ -70,7 +70,7 @@ The service validates RabbitMQ connectivity during startup. If RabbitMQ remains 
 2. Waits for file stability, then atomically moves the file to `processing/`.
 3. Streams CSV rows and skips the header row.
 4. Publishes each valid payment row to the configured domestic or cross-border RabbitMQ request queue.
-5. Persists processing state in DB for idempotency, resume support, and row dispatch status.
+5. Persists processing state in DB for idempotency, resume support, and row dispatch status. Row failures publish EV002; successful rows do not publish per-row events.
 6. Moves successful files to date-partitioned `archive/YYYY/MM/DD/`.
 7. Publishes an EV001 file-loaded event to the configured RabbitMQ topic exchange.
 8. Moves failed files to `error/`.
@@ -142,6 +142,7 @@ The service validates RabbitMQ connectivity during startup. If RabbitMQ remains 
 - `OFTL_RABITMQ_EXCHANGE_TYPE` (default: `direct`)
 - `OFTL_RABITMQ_PUBEVENT_EXCHANGE` (default: `paytrace.events`) — Topic exchange for file lifecycle events
 - `OFTL_RABITMQ_PUBEVENT_EV001` (default: `files.csv.loaded`) — Routing key for EV001 file loaded events
+- `OFTL_RABITMQ_PUBEVENT_EV002` (default: `files.csv.row.failed`) — Routing key for EV002 row failed events
 - `OFTL_RABITMQ_MESSAGE_PERSISTENT` (default: `true`)
 - `OFTL_RABITMQ_PUBLISH_MANDATORY` (default: `false`)
 - `OFTL_RABITMQ_DOEMSTIC_REQUEST_QUEUE` (default: `CSV.PAYMENTS.DOMESTIC.REQ`) — Queue name for domestic payment transfer requests
@@ -161,6 +162,8 @@ For each parsed payment row, the worker publishes the schema-driven payment payl
 
 - `OFTL_RABITMQ_DOEMSTIC_REQUEST_QUEUE` when `transfer_type` is `DOMESTIC`
 - `OFTL_RABITMQ_CROSS_BORDER_REQUEST_QUEUE` when `transfer_type` is `CROSS_BORDER`
+
+Successful rows do not publish a per-row event. When a row fails processing, including rejection because the transfer signature was already published, the worker publishes EV002 to `OFTL_RABITMQ_PUBEVENT_EXCHANGE` as a RabbitMQ `topic` exchange message. The routing key comes from `OFTL_RABITMQ_PUBEVENT_EV002` and defaults to `files.csv.row.failed`.
 
 After a file is fully processed, archived, and marked completed in `oftl_fwcsv_registry`, the worker publishes EV001 to `OFTL_RABITMQ_PUBEVENT_EXCHANGE` as a RabbitMQ `topic` exchange message. The routing key comes from `OFTL_RABITMQ_PUBEVENT_EV001` and defaults to `files.csv.loaded`.
 
@@ -185,6 +188,30 @@ EV001 envelope:
     "row_count": 6,
     "started_at": "UTC ISO-8601 timestamp",
     "ended_at": "UTC ISO-8601 timestamp"
+  }
+}
+```
+
+EV002 envelope:
+
+```json
+{
+  "event_id": "generated UUID",
+  "event_code": "EV002",
+  "event_type": "files.csv.row.failed",
+  "event_version": "1.0",
+  "timestamp": "UTC ISO-8601 timestamp",
+  "source": "paytrace-file-ingest-csv",
+  "correlation_id": "generated UUID",
+  "causation_id": "transfer_id or file_id",
+  "payload": {
+    "event": "row_failed",
+    "file_id": "file fingerprint",
+    "filename": "CSV filename",
+    "row_number": 2,
+    "transfer_id": "payment transfer_id when available",
+    "failure_reason": "row_processing_failed or redundant_signature",
+    "error_message": "failure detail"
   }
 }
 ```

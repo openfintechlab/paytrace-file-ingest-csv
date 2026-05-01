@@ -66,7 +66,18 @@ class CSVFileProcessor:
                 file_id=claimed.fingerprint,
                 filename=claimed.source_name,
             )
-            self._archive_file(claimed.claimed_path, "duplicate")
+            archived_path = self._archive_file(claimed.claimed_path, "duplicate")
+            event_ts = datetime.now(timezone.utc)
+            self._emit_processed_event(
+                claimed,
+                archived_path,
+                int(existing.get("row_count", 0) or 0),
+                checksum,
+                event_ts,
+                event_ts,
+                status="error",
+                error_message="Idempotency",
+            )
             return
 
         start_ts = datetime.now(timezone.utc)
@@ -141,12 +152,21 @@ class CSVFileProcessor:
 
             existing_dispatch = self._row_dispatch_get(transfer_id)
             if existing_dispatch and existing_dispatch.get("status") == "published":
+                error_message = "Row rejected because transfer signature was already published."
                 Logging.info_context(
                     "Skipping already published payment row.",
                     transfer_id=transfer_id,
                     file_id=file_id or "unknown",
                     row_number=row_number,
                     request_queue=request_queue,
+                )
+                self._emit_row_failed_event(
+                    transfer_id=transfer_id,
+                    file_id=file_id or "",
+                    row_number=row_number,
+                    file_path=file_path,
+                    error_message=error_message,
+                    failure_reason="redundant_signature",
                 )
                 return
 
@@ -176,6 +196,14 @@ class CSVFileProcessor:
                     row_number=row_number,
                     error_message=str(exc),
                 )
+            self._emit_row_failed_event(
+                transfer_id=transfer_id,
+                file_id=file_id or "",
+                row_number=row_number,
+                file_path=file_path,
+                error_message=str(exc),
+                failure_reason="row_processing_failed",
+            )
             Logging.error_context(
                 "Error processing payment row.",
                 transfer_id=transfer_id or "unknown",
@@ -199,7 +227,7 @@ class CSVFileProcessor:
 
     def _registry_get(self, file_id: str) -> dict[str, Any] | None:
         rows = DBHelper.execute_select(
-            "SELECT file_id, status, checksum_sha256 FROM oftl_fwcsv_registry WHERE file_id = :file_id",
+            "SELECT file_id, status, checksum_sha256, row_count FROM oftl_fwcsv_registry WHERE file_id = :file_id",
             {"file_id": file_id},
         )
         return rows[0] if rows else None
@@ -388,6 +416,8 @@ class CSVFileProcessor:
         checksum: str,
         started_at: datetime,
         ended_at: datetime,
+        status: str | None = None,
+        error_message: str | None = None,
     ) -> None:
         routing_key = str(ConfigLoader.get("OFTL_RABITMQ_PUBEVENT_EV001", "files.csv.loaded")).strip()
         if not routing_key:
@@ -414,6 +444,11 @@ class CSVFileProcessor:
                 "ended_at": ended_at.isoformat(),
             },
         }
+        if status is not None:
+            event["payload"]["status"] = status
+        if error_message is not None:
+            event["payload"]["error_message"] = error_message[:2000]
+
         exchange_name = str(ConfigLoader.get("OFTL_RABITMQ_PUBEVENT_EXCHANGE", "paytrace.events")).strip()
         if not exchange_name:
             raise ValueError("OFTL_RABITMQ_PUBEVENT_EXCHANGE must be configured for EV001 publishing.")
@@ -426,5 +461,56 @@ class CSVFileProcessor:
             correlation_id=checksum,
             message_id=event_id,
             headers={"event_code": "EV001", "file_id": claimed.fingerprint},
+        )
+        Logging.info(f"Event with ID: {event_id} and code: {event['event_code']} published to topic: {routing_key} ")
+
+    def _emit_row_failed_event(
+        self,
+        *,
+        transfer_id: str,
+        file_id: str,
+        row_number: int,
+        file_path: Path,
+        error_message: str,
+        failure_reason: str,
+    ) -> None:
+        routing_key = str(ConfigLoader.get("OFTL_RABITMQ_PUBEVENT_EV002", "files.csv.row.failed")).strip()
+        if not routing_key:
+            raise ValueError("OFTL_RABITMQ_PUBEVENT_EV002 must be configured for EV002 publishing.")
+
+        exchange_name = str(ConfigLoader.get("OFTL_RABITMQ_PUBEVENT_EXCHANGE", "paytrace.events")).strip()
+        if not exchange_name:
+            raise ValueError("OFTL_RABITMQ_PUBEVENT_EXCHANGE must be configured for EV002 publishing.")
+
+        event_id = str(uuid.uuid4())
+        correlation_id = str(uuid.uuid4())
+        event = {
+            "event_id": event_id,
+            "event_code": "EV002",
+            "event_type": routing_key,
+            "event_version": "1.0",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "paytrace-file-ingest-csv",
+            "correlation_id": correlation_id,
+            "causation_id": transfer_id or file_id,
+            "payload": {
+                "event": "row_failed",
+                "file_id": file_id,
+                "filename": file_path.name,
+                "row_number": row_number,
+                "transfer_id": transfer_id,
+                "failure_reason": failure_reason,
+                "error_message": error_message[:2000],
+            },
+        }
+
+        RabbitMQHelper.publish_message(
+            exchange_name,
+            routing_key,
+            event,
+            exchange_type="topic",
+            correlation_id=correlation_id,
+            message_id=event_id,
+            headers={"event_code": "EV002", "file_id": file_id, "row_number": row_number},
         )
         Logging.info(f"Event with ID: {event_id} and code: {event['event_code']} published to topic: {routing_key} ")
