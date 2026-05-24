@@ -9,7 +9,7 @@ import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 try:
     from utilities.ConfigLoader import ConfigLoader
@@ -34,6 +34,96 @@ MoveToError = Callable[[Path], Path]
 
 class CSVFileProcessor:
     """Processes a claimed payment CSV file and dispatches its payment rows."""
+
+    _SQL_REGISTRY_GET: ClassVar[str] = (
+        "SELECT file_id, status, checksum_sha256, row_count "
+        "FROM oftl_fwcsv_registry WHERE file_id = :file_id"
+    )
+    _SQL_REGISTRY_MARK_STARTED: ClassVar[str] = """
+        INSERT INTO oftl_fwcsv_registry (
+            file_id, filename, file_size, mtime_ns, checksum_sha256, status, started_at, updated_at
+        ) VALUES (
+            :file_id, :filename, :file_size, :mtime_ns, :checksum_sha256, 'processing', :started_at, NOW()
+        )
+        ON CONFLICT (file_id) DO UPDATE
+        SET
+            filename = EXCLUDED.filename,
+            file_size = EXCLUDED.file_size,
+            mtime_ns = EXCLUDED.mtime_ns,
+            checksum_sha256 = EXCLUDED.checksum_sha256,
+            status = '',
+            started_at = EXCLUDED.started_at,
+            error_message = NULL,
+            updated_at = NOW()
+    """
+    _SQL_REGISTRY_MARK_COMPLETED: ClassVar[str] = """
+        UPDATE oftl_fwcsv_registry
+        SET
+            status = 'COMPLETED',
+            row_count = :row_count,
+            checksum_sha256 = :checksum,
+            ended_at = :ended_at,
+            updated_at = NOW()
+        WHERE file_id = :file_id
+    """
+    _SQL_REGISTRY_MARK_FAILED: ClassVar[str] = """
+        UPDATE oftl_fwcsv_registry
+        SET
+            status = 'FAILED',
+            row_count = :row_count,
+            error_message = :error_message,
+            ended_at = NOW(),
+            updated_at = NOW()
+        WHERE file_id = :file_id
+    """
+    _SQL_CHECKPOINT_GET: ClassVar[str] = (
+        "SELECT row_number FROM oftl_fwcsv_checkpoint WHERE file_id = :file_id"
+    )
+    _SQL_CHECKPOINT_UPSERT: ClassVar[str] = """
+        INSERT INTO oftl_fwcsv_checkpoint (file_id, row_number, updated_at)
+        VALUES (:file_id, :row_number, NOW())
+        ON CONFLICT (file_id) DO UPDATE
+        SET row_number = EXCLUDED.row_number,
+            updated_at = NOW()
+    """
+    _SQL_CHECKPOINT_DELETE: ClassVar[str] = (
+        "DELETE FROM oftl_fwcsv_checkpoint WHERE file_id = :file_id"
+    )
+    _SQL_ROW_DISPATCH_GET: ClassVar[str] = """
+        SELECT transfer_id, file_id, row_number, request_queue, status, published_at, error_message
+        FROM oftl_fwcsv_row_dispatch
+        WHERE transfer_id = :transfer_id
+    """
+    _SQL_ROW_DISPATCH_MARK_PUBLISHED: ClassVar[str] = """
+        INSERT INTO oftl_fwcsv_row_dispatch (
+            transfer_id, file_id, row_number, request_queue, status, published_at, updated_at, error_message
+        ) VALUES (
+            :transfer_id, :file_id, :row_number, :request_queue, 'published', NOW(), NOW(), NULL
+        )
+        ON CONFLICT (transfer_id) DO UPDATE
+        SET
+            file_id = EXCLUDED.file_id,
+            row_number = EXCLUDED.row_number,
+            request_queue = EXCLUDED.request_queue,
+            status = 'published',
+            published_at = NOW(),
+            updated_at = NOW(),
+            error_message = NULL
+    """
+    _SQL_ROW_DISPATCH_MARK_FAILED: ClassVar[str] = """
+        INSERT INTO oftl_fwcsv_row_dispatch (
+            transfer_id, file_id, row_number, request_queue, status, published_at, updated_at, error_message
+        ) VALUES (
+            :transfer_id, :file_id, :row_number, '', 'failed', NULL, NOW(), :error_message
+        )
+        ON CONFLICT (transfer_id) DO UPDATE
+        SET
+            file_id = EXCLUDED.file_id,
+            row_number = EXCLUDED.row_number,
+            status = 'failed',
+            updated_at = NOW(),
+            error_message = EXCLUDED.error_message
+    """
 
     def __init__(
         self,
@@ -227,30 +317,14 @@ class CSVFileProcessor:
 
     def _registry_get(self, file_id: str) -> dict[str, Any] | None:
         rows = DBHelper.execute_select(
-            "SELECT file_id, status, checksum_sha256, row_count FROM oftl_fwcsv_registry WHERE file_id = :file_id",
+            self._SQL_REGISTRY_GET,
             {"file_id": file_id},
         )
         return rows[0] if rows else None
 
     def _registry_mark_started(self, claimed: "ClaimedFile", checksum: str, started_at: datetime) -> None:
         DBHelper.execute_update(
-            """
-            INSERT INTO oftl_fwcsv_registry (
-                file_id, filename, file_size, mtime_ns, checksum_sha256, status, started_at, updated_at
-            ) VALUES (
-                :file_id, :filename, :file_size, :mtime_ns, :checksum_sha256, 'processing', :started_at, NOW()
-            )
-            ON CONFLICT (file_id) DO UPDATE
-            SET
-                filename = EXCLUDED.filename,
-                file_size = EXCLUDED.file_size,
-                mtime_ns = EXCLUDED.mtime_ns,
-                checksum_sha256 = EXCLUDED.checksum_sha256,
-                status = 'processing',
-                started_at = EXCLUDED.started_at,
-                error_message = NULL,
-                updated_at = NOW()
-            """,
+            self._SQL_REGISTRY_MARK_STARTED,
             {
                 "file_id": claimed.fingerprint,
                 "filename": claimed.source_name,
@@ -269,16 +343,7 @@ class CSVFileProcessor:
         ended_at: datetime,
     ) -> None:
         DBHelper.execute_update(
-            """
-            UPDATE oftl_fwcsv_registry
-            SET
-                status = 'completed',
-                row_count = :row_count,
-                checksum_sha256 = :checksum,
-                ended_at = :ended_at,
-                updated_at = NOW()
-            WHERE file_id = :file_id
-            """,
+            self._SQL_REGISTRY_MARK_COMPLETED,
             {
                 "file_id": claimed.fingerprint,
                 "row_count": row_count,
@@ -289,16 +354,7 @@ class CSVFileProcessor:
 
     def _registry_mark_failed(self, claimed: "ClaimedFile", row_count: int, error_message: str) -> None:
         DBHelper.execute_update(
-            """
-            UPDATE oftl_fwcsv_registry
-            SET
-                status = 'failed',
-                row_count = :row_count,
-                error_message = :error_message,
-                ended_at = NOW(),
-                updated_at = NOW()
-            WHERE file_id = :file_id
-            """,
+            self._SQL_REGISTRY_MARK_FAILED,
             {
                 "file_id": claimed.fingerprint,
                 "row_count": row_count,
@@ -308,7 +364,7 @@ class CSVFileProcessor:
 
     def _checkpoint_get(self, file_id: str) -> int:
         rows = DBHelper.execute_select(
-            "SELECT row_number FROM oftl_fwcsv_checkpoint WHERE file_id = :file_id",
+            self._SQL_CHECKPOINT_GET,
             {"file_id": file_id},
         )
         if not rows:
@@ -317,29 +373,19 @@ class CSVFileProcessor:
 
     def _checkpoint_upsert(self, file_id: str, row_number: int) -> None:
         DBHelper.execute_update(
-            """
-            INSERT INTO oftl_fwcsv_checkpoint (file_id, row_number, updated_at)
-            VALUES (:file_id, :row_number, NOW())
-            ON CONFLICT (file_id) DO UPDATE
-            SET row_number = EXCLUDED.row_number,
-                updated_at = NOW()
-            """,
+            self._SQL_CHECKPOINT_UPSERT,
             {"file_id": file_id, "row_number": row_number},
         )
 
     def _checkpoint_delete(self, file_id: str) -> None:
         DBHelper.execute_delete(
-            "DELETE FROM oftl_fwcsv_checkpoint WHERE file_id = :file_id",
+            self._SQL_CHECKPOINT_DELETE,
             {"file_id": file_id},
         )
 
     def _row_dispatch_get(self, transfer_id: str) -> dict[str, Any] | None:
         rows = DBHelper.execute_select(
-            """
-            SELECT transfer_id, file_id, row_number, request_queue, status, published_at, error_message
-            FROM oftl_fwcsv_row_dispatch
-            WHERE transfer_id = :transfer_id
-            """,
+            self._SQL_ROW_DISPATCH_GET,
             {"transfer_id": transfer_id},
         )
         return rows[0] if rows else None
@@ -353,22 +399,7 @@ class CSVFileProcessor:
         request_queue: str,
     ) -> None:
         DBHelper.execute_update(
-            """
-            INSERT INTO oftl_fwcsv_row_dispatch (
-                transfer_id, file_id, row_number, request_queue, status, published_at, updated_at, error_message
-            ) VALUES (
-                :transfer_id, :file_id, :row_number, :request_queue, 'published', NOW(), NOW(), NULL
-            )
-            ON CONFLICT (transfer_id) DO UPDATE
-            SET
-                file_id = EXCLUDED.file_id,
-                row_number = EXCLUDED.row_number,
-                request_queue = EXCLUDED.request_queue,
-                status = 'published',
-                published_at = NOW(),
-                updated_at = NOW(),
-                error_message = NULL
-            """,
+            self._SQL_ROW_DISPATCH_MARK_PUBLISHED,
             {
                 "transfer_id": transfer_id,
                 "file_id": file_id,
@@ -386,20 +417,7 @@ class CSVFileProcessor:
         error_message: str,
     ) -> None:
         DBHelper.execute_update(
-            """
-            INSERT INTO oftl_fwcsv_row_dispatch (
-                transfer_id, file_id, row_number, request_queue, status, published_at, updated_at, error_message
-            ) VALUES (
-                :transfer_id, :file_id, :row_number, '', 'failed', NULL, NOW(), :error_message
-            )
-            ON CONFLICT (transfer_id) DO UPDATE
-            SET
-                file_id = EXCLUDED.file_id,
-                row_number = EXCLUDED.row_number,
-                status = 'failed',
-                updated_at = NOW(),
-                error_message = EXCLUDED.error_message
-            """,
+            self._SQL_ROW_DISPATCH_MARK_FAILED,
             {
                 "transfer_id": transfer_id,
                 "file_id": file_id,

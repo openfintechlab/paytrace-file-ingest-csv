@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import ClassVar
 
 try:
     from domain import CSVFileProcessor
@@ -40,11 +41,34 @@ class ClaimedFile:
 
 class FileWatcherAgent:
     """Hybrid watcher/scanner with robust claim, checkpoint, and archiving semantics."""
-    _REQUIRED_TABLES = (
+    _REQUIRED_TABLES: ClassVar[tuple[str, ...]] = (
         "oftl_fwcsv_registry",
         "oftl_fwcsv_checkpoint",
         "oftl_fwcsv_row_dispatch",
     )
+    _SQL_GET_RELATION_NAME: ClassVar[str] = "SELECT to_regclass(:qualified_name) AS relation_name"
+    _SQL_CREATE_REGISTRY_TABLE: ClassVar[str] = """
+        CREATE TABLE IF NOT EXISTS oftl_fwcsv_registry (
+            file_id VARCHAR(128) PRIMARY KEY,
+            filename TEXT NOT NULL,
+            file_size BIGINT NOT NULL,
+            mtime_ns BIGINT NOT NULL,
+            checksum_sha256 VARCHAR(64),
+            status VARCHAR(32) NOT NULL,
+            row_count BIGINT NOT NULL DEFAULT 0,
+            error_message TEXT,
+            started_at TIMESTAMPTZ,
+            ended_at TIMESTAMPTZ,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """
+    _SQL_CREATE_CHECKPOINT_TABLE: ClassVar[str] = """
+        CREATE TABLE IF NOT EXISTS oftl_fwcsv_checkpoint (
+            file_id VARCHAR(128) PRIMARY KEY,
+            row_number BIGINT NOT NULL DEFAULT 0,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """
 
     def __init__(self) -> None:
         self.root_dir = Path(ConfigLoader.get("OFTL_FWCSV_ROOTDIR", "./fwcsv")).resolve()
@@ -114,7 +138,7 @@ class FileWatcherAgent:
 
         for table_name in self._REQUIRED_TABLES:
             rows = DBHelper.execute_select(
-                "SELECT to_regclass(:qualified_name) AS relation_name",
+                self._SQL_GET_RELATION_NAME,
                 {"qualified_name": f"{schema}.{table_name}"},
             )
             relation_name = rows[0].get("relation_name") if rows else None
@@ -142,31 +166,11 @@ class FileWatcherAgent:
             raise RuntimeError("Database is required for checkpoint/idempotency and could not be initialized.")
 
         DBHelper.execute_update(
-            """
-            CREATE TABLE IF NOT EXISTS oftl_fwcsv_registry (
-                file_id VARCHAR(128) PRIMARY KEY,
-                filename TEXT NOT NULL,
-                file_size BIGINT NOT NULL,
-                mtime_ns BIGINT NOT NULL,
-                checksum_sha256 VARCHAR(64),
-                status VARCHAR(32) NOT NULL,
-                row_count BIGINT NOT NULL DEFAULT 0,
-                error_message TEXT,
-                started_at TIMESTAMPTZ,
-                ended_at TIMESTAMPTZ,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            """
+            self._SQL_CREATE_REGISTRY_TABLE
         )
 
         DBHelper.execute_update(
-            """
-            CREATE TABLE IF NOT EXISTS oftl_fwcsv_checkpoint (
-                file_id VARCHAR(128) PRIMARY KEY,
-                row_number BIGINT NOT NULL DEFAULT 0,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            """
+            self._SQL_CREATE_CHECKPOINT_TABLE
         )
 
     async def _watch_events_loop(self) -> None:
@@ -419,4 +423,3 @@ class FileWatcherAgent:
     @staticmethod
     def _is_csv_path(path_str: str) -> bool:
         return Path(path_str).suffix.lower() == ".csv"
-

@@ -31,6 +31,7 @@ class DBHelper:
     _DEFAULT_POOL_SIZE: ClassVar[int] = 10
     _DEFAULT_DB_NAME: ClassVar[str] = "public"
     _DEFAULT_DB_SCHEMA: ClassVar[str] = "public"
+    _SQL_CONNECTION_CHECK: ClassVar[str] = "SELECT 1"
 
     def __new__(cls) -> "DBHelper":
         if cls._instance is None:
@@ -128,7 +129,7 @@ class DBHelper:
 
             try:
                 with cls._engine.connect() as connection:
-                    connection.execute(text("SELECT 1"))
+                    connection.execute(text(cls._SQL_CONNECTION_CHECK))
                 Logging.info_context(
                     "Database connection initialized successfully.",
                     schema=db_schema,
