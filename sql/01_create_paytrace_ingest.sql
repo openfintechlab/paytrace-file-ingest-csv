@@ -45,8 +45,8 @@ CREATE INDEX IF NOT EXISTS idx_oftl_fwcsv_row_dispatch_updated_at
 
 ALTER TABLE oftl_fwcsv_row_dispatch
     ADD CONSTRAINT chk_oftl_fwcsv_row_dispatch_status
-    CHECK (status IN ('published', 'failed', 'processed'));
+    CHECK (status IN ('PUBLISHED', 'FAILED', 'PROCESSED'));
 
 ALTER TABLE oftl_fwcsv_registry
     ADD CONSTRAINT chk_oftl_fwcsv_registry_status
-    CHECK (status IN ('COMPLETED', 'FAILED', 'PROCESSED', 'PROCESSING', 'RESP_FILE_GENERATED'));
+    CHECK (status IN ('COMPLETED', 'FAILED', 'PROCESSED', 'PROCESSING', 'RESP_FILE_GENERATED', 'READY_FOR_RESPONSE', 'RESP_FILE_GENERATED'));
