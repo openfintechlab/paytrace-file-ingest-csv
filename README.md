@@ -327,7 +327,7 @@ CREATE INDEX IF NOT EXISTS idx_oftl_fwcsv_row_dispatch_updated_at
 
 ALTER TABLE oftl_fwcsv_row_dispatch
     ADD CONSTRAINT chk_oftl_fwcsv_row_dispatch_status
-    CHECK (status IN ('published', 'failed', 'processed'));
+    CHECK (status IN ('PUBLISHED', 'FAILED', 'PROCESSED'));
 
 ```
 

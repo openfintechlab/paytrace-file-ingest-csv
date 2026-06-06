@@ -434,13 +434,74 @@ def test_stream_process_csv_uses_file_header_for_legacy_column_layout(watcher_ag
 
     processed_rows = processor._stream_process_csv(csv_file, "file-123", resume_row=0)
 
-    assert processed_rows == 2
+    assert processed_rows == 1
     assert observed["row_number"] == 2
     assert observed["file_id"] == "file-123"
     assert observed["row_payload"]["remittance_reference"] == "INV-7843"
     assert observed["row_payload"]["remittance_unstructured"] == "Invoice 7843 - office supplies"
     assert "intermediary_bank_bic" not in observed["row_payload"]
     assert checkpoints == [2]
+
+
+def test_process_claimed_file_marks_failed_with_data_row_count(watcher_agent, monkeypatch, tmp_path):
+    processor = watcher_agent._csv_file_processor
+    claimed_path = tmp_path / "processing" / "failed.csv"
+    claimed_path.parent.mkdir(parents=True, exist_ok=True)
+    claimed_path.write_text("transfer_id,transfer_type\nPTX-1,DOMESTIC\n", encoding="utf-8")
+    claimed = ClaimedFile(
+        source_name="failed.csv",
+        claimed_path=claimed_path,
+        fingerprint="file-123",
+        size=claimed_path.stat().st_size,
+        mtime_ns=claimed_path.stat().st_mtime_ns,
+    )
+    failed_registry: dict[str, object] = {}
+
+    monkeypatch.setattr(processor, "_compute_sha256_streaming", lambda _path: "checksum-1")
+    monkeypatch.setattr(processor, "_registry_get", lambda _file_id: {"status": "processing", "checksum_sha256": "checksum-1"})
+    monkeypatch.setattr(processor, "_registry_mark_started", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(processor, "_checkpoint_get", lambda _file_id: 0)
+    monkeypatch.setattr(processor, "_checkpoint_delete", lambda _file_id: (_ for _ in ()).throw(AssertionError("should not delete checkpoint")))
+    monkeypatch.setattr(processor, "_process_csv_row", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("publish failed")))
+    monkeypatch.setattr(processor, "_move_to_error", lambda _path: tmp_path / "error" / "failed.csv")
+
+    def _capture_failed(_claimed, row_count, error_message):
+        failed_registry["row_count"] = row_count
+        failed_registry["error_message"] = error_message
+
+    monkeypatch.setattr(processor, "_registry_mark_failed", _capture_failed)
+
+    with pytest.raises(RuntimeError, match="publish failed"):
+        processor.process_claimed_file(claimed)
+
+    assert failed_registry == {"row_count": 1, "error_message": "publish failed"}
+
+
+def test_row_dispatch_writes_constraint_compatible_statuses(watcher_agent, monkeypatch):
+    processor = watcher_agent._csv_file_processor
+    updates: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr(
+        csv_processor_module.DBHelper,
+        "execute_update",
+        lambda query, params=None: updates.append((query, params or {})) or 1,
+    )
+
+    processor._row_dispatch_mark_published(
+        transfer_id="PTX-001",
+        file_id="file-123",
+        row_number=2,
+        request_queue="CSV.PAYMENTS.DOMESTIC.REQ",
+    )
+    processor._row_dispatch_mark_failed(
+        transfer_id="PTX-002",
+        file_id="file-123",
+        row_number=3,
+        error_message="validation failed",
+    )
+
+    assert "'PUBLISHED'" in updates[0][0]
+    assert "'FAILED'" in updates[1][0]
 
 
 def test_process_csv_row_reraises_rabbitmq_publish_errors(watcher_agent, monkeypatch, tmp_path):

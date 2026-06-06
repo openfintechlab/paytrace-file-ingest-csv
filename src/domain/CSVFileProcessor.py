@@ -43,7 +43,7 @@ class CSVFileProcessor:
         INSERT INTO oftl_fwcsv_registry (
             file_id, filename, file_size, mtime_ns, checksum_sha256, status, started_at, updated_at
         ) VALUES (
-            :file_id, :filename, :file_size, :mtime_ns, :checksum_sha256, 'processing', :started_at, NOW()
+            :file_id, :filename, :file_size, :mtime_ns, :checksum_sha256, 'PROCESSING', :started_at, NOW()
         )
         ON CONFLICT (file_id) DO UPDATE
         SET
@@ -51,7 +51,7 @@ class CSVFileProcessor:
             file_size = EXCLUDED.file_size,
             mtime_ns = EXCLUDED.mtime_ns,
             checksum_sha256 = EXCLUDED.checksum_sha256,
-            status = '',
+            status = 'PROCESSING',
             started_at = EXCLUDED.started_at,
             error_message = NULL,
             updated_at = NOW()
@@ -98,14 +98,14 @@ class CSVFileProcessor:
         INSERT INTO oftl_fwcsv_row_dispatch (
             transfer_id, file_id, row_number, request_queue, status, published_at, updated_at, error_message
         ) VALUES (
-            :transfer_id, :file_id, :row_number, :request_queue, 'published', NOW(), NOW(), NULL
+            :transfer_id, :file_id, :row_number, :request_queue, 'PUBLISHED', NOW(), NOW(), NULL
         )
         ON CONFLICT (transfer_id) DO UPDATE
         SET
             file_id = EXCLUDED.file_id,
             row_number = EXCLUDED.row_number,
             request_queue = EXCLUDED.request_queue,
-            status = 'published',
+            status = 'PUBLISHED',
             published_at = NOW(),
             updated_at = NOW(),
             error_message = NULL
@@ -114,13 +114,13 @@ class CSVFileProcessor:
         INSERT INTO oftl_fwcsv_row_dispatch (
             transfer_id, file_id, row_number, request_queue, status, published_at, updated_at, error_message
         ) VALUES (
-            :transfer_id, :file_id, :row_number, '', 'failed', NULL, NOW(), :error_message
+            :transfer_id, :file_id, :row_number, '', 'FAILED', NULL, NOW(), :error_message
         )
         ON CONFLICT (transfer_id) DO UPDATE
         SET
             file_id = EXCLUDED.file_id,
             row_number = EXCLUDED.row_number,
-            status = 'failed',
+            status = 'FAILED',
             updated_at = NOW(),
             error_message = EXCLUDED.error_message
     """
@@ -150,7 +150,7 @@ class CSVFileProcessor:
             )
             self._checkpoint_delete(claimed.fingerprint)
 
-        if existing and existing.get("status") == "completed" and existing.get("checksum_sha256") == checksum:
+        if existing and str(existing.get("status", "")).upper() == "COMPLETED" and existing.get("checksum_sha256") == checksum:
             Logging.info_context(
                 "Idempotency skip for completed file.",
                 file_id=claimed.fingerprint,
@@ -184,39 +184,52 @@ class CSVFileProcessor:
             self._registry_mark_completed(claimed, rows_processed, checksum, end_ts)
             self._emit_processed_event(claimed, archived_path, rows_processed, checksum, start_ts, end_ts)
         except Exception as exc:
+            rows_processed = int(getattr(exc, "data_row_count", rows_processed) or rows_processed)
             self._registry_mark_failed(claimed, rows_processed, str(exc))
             self._move_to_error(claimed.claimed_path)
             raise
 
     def _stream_process_csv(self, file_path: Path, file_id: str, resume_row: int) -> int:
         row_number = 0
+        data_row_count = 0
         Logging.info_context("Starting processing file.", file_id=file_id, file_path=str(file_path), resume_row=resume_row)
-        with file_path.open("r", encoding=self.file_encoding, newline="") as handle:
-            reader = csv.reader(handle)
-            header: list[str] | None = None
-            for row in reader:
-                row_number += 1
-                if row_number == 1:
-                    header = [column.strip() for column in row]
-                    Logging.info_context("Skipping header row.", file_id=file_id, file_path=str(file_path))
-                    continue
+        try:
+            with file_path.open("r", encoding=self.file_encoding, newline="") as handle:
+                reader = csv.reader(handle)
+                header: list[str] | None = None
+                for row in reader:
+                    row_number += 1
+                    if row_number == 1:
+                        header = [column.strip() for column in row]
+                        Logging.info_context("Skipping header row.", file_id=file_id, file_path=str(file_path))
+                        continue
 
-                if row_number <= resume_row:
-                    continue
+                    data_row_count += 1
+                    if row_number <= resume_row:
+                        continue
 
-                row_payload: list[str] | dict[str, str] = row
-                if header is not None:
-                    if len(row) != len(header):
-                        raise ValueError(
-                            f"CSV row has {len(row)} fields but header defines {len(header)} columns"
-                        )
-                    row_payload = dict(zip(header, row))
+                    row_payload: list[str] | dict[str, str] = row
+                    if header is not None:
+                        if len(row) != len(header):
+                            raise ValueError(
+                                f"CSV row has {len(row)} fields but header defines {len(header)} columns"
+                            )
+                        row_payload = dict(zip(header, row))
 
-                self._process_csv_row(row_payload, row_number, file_path, file_id=file_id)
-                self._checkpoint_upsert(file_id, row_number)
+                    self._process_csv_row(row_payload, row_number, file_path, file_id=file_id)
+                    self._checkpoint_upsert(file_id, row_number)
+        except Exception as exc:
+            setattr(exc, "data_row_count", data_row_count)
+            raise
 
-        Logging.info_context("Completed processing file.", file_id=file_id, file_path=str(file_path), total_rows=row_number)
-        return row_number
+        Logging.info_context(
+            "Completed processing file.",
+            file_id=file_id,
+            file_path=str(file_path),
+            total_rows=row_number,
+            data_rows=data_row_count,
+        )
+        return data_row_count
 
     def _process_csv_row(
         self,
@@ -241,7 +254,7 @@ class CSVFileProcessor:
                 raise ValueError("RabbitMQ request queue is not configured for the parsed payment.")
 
             existing_dispatch = self._row_dispatch_get(transfer_id)
-            if existing_dispatch and existing_dispatch.get("status") == "published":
+            if existing_dispatch and str(existing_dispatch.get("status", "")).upper() == "PUBLISHED":
                 error_message = "Row rejected because transfer signature was already published."
                 Logging.info_context(
                     "Skipping already published payment row.",
