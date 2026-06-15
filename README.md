@@ -2,7 +2,11 @@
 
 ## Introduction
 
-This project provides a production-style CSV ingest worker for PayTrace, plus shared utilities:
+`paytrace-file-ingest-csv` is the PayTrace entry point for file-based payment initiation. It watches an agreed CSV inbox, claims stable files for processing, validates every payment row against the shared PayTrace payment instruction schema, persists file and row state for idempotency, and publishes valid payment instructions to RabbitMQ for downstream processing.
+
+In the PayTrace architecture, this service converts batch files into reliable, traceable payment work. It is responsible for protecting downstream services from malformed CSV rows, preventing duplicate file and transfer processing, and emitting file lifecycle events that allow the orchestrator to decide when a complete response file can be generated.
+
+The implementation includes:
 
 - Environment/configuration loading from `.env` and process environment (`ConfigLoader`)
 - Centralized application logging (`Logging`)
@@ -63,6 +67,37 @@ uv run python src/main.py
 ```
 
 The service validates RabbitMQ connectivity during startup. If RabbitMQ remains unavailable after the configured retry budget, the process exits with status code `99`.
+
+## Docker
+
+Build the image from this project root:
+
+```bash
+docker build -t paytrace-file-ingest:latest .
+```
+
+The Dockerfile uses build arguments for its base images. Defaults are safe for local builds:
+
+```text
+DOCKER_PYTHON_BUILDER_IMAGE=dhi.io/python:3-debian13-sfw-dev
+DOCKER_PYTHON_RUNTIME_IMAGE=dhi.io/python:3
+```
+
+Override them when needed:
+
+```bash
+docker build \
+  --build-arg DOCKER_PYTHON_BUILDER_IMAGE=dhi.io/python:3-debian13-sfw-dev \
+  --build-arg DOCKER_PYTHON_RUNTIME_IMAGE=dhi.io/python:3 \
+  -t paytrace-file-ingest:latest .
+```
+
+The GitHub Docker build workflow reads the same values from GitHub Actions variables named `DOCKER_PYTHON_BUILDER_IMAGE` and `DOCKER_PYTHON_RUNTIME_IMAGE`, falling back to the defaults above when the variables are not set. Published images use the Docker Hub repository `openfintechlab/paytrace-file-ingest`.
+
+Commit message controls:
+
+- `[build docker]` builds the image.
+- `[buildandpush docker]` builds and pushes the image.
 
 ## File Processing Flow
 

@@ -1,0 +1,112 @@
+name: Docker Build Pipeline
+
+on:
+  push:
+    branches:
+      - "main"
+      - "develop"
+      - "dev/*"
+      - "feature/*"
+      - "release/*"
+  pull_request:
+    branches:
+      - "main"
+      - "develop"
+      - "dev/*"
+      - "feature/*"
+      - "release/*"
+
+# Required permissions for repository checkout
+permissions:
+  contents: read
+
+jobs:
+  determine-strategy:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      should_push: ${{ steps.check.outputs.should_push }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          commit_message="$(git log -1 --pretty=%B || true)"
+
+          # 1. Evaluate Build Intent
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif grep -Eq "\[(build|buildandpush) docker\]" <<< "${commit_message}"; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # 2. Evaluate Push Intent (Only push on true branch merges, not active Pull Requests)
+          if [ "${EVENT_NAME}" = "push" ] && { [ "${REF_NAME}" = "main" ] || [ "${REF_NAME}" = "develop" ] || [[ "${REF_NAME}" == release/* ]] || grep -q "\[buildandpush docker\]" <<< "${commit_message}"; }; then
+            echo "should_push=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_push=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-publish:
+    needs: determine-strategy
+    if: ${{ needs.determine-strategy.outputs.should_build == 'true' || needs.determine-strategy.outputs.should_push == 'true' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare Docker Tags
+        id: docker-tags
+        run: |
+          branch_tag="$(printf '%s' "${GITHUB_REF_NAME}" | sed -E 's/[^A-Za-z0-9_.-]+/-/g; s/^-+//; s/-+$//')"
+          if [ -z "${branch_tag}" ]; then
+            branch_tag="${GITHUB_SHA}"
+          fi
+          echo "branch_tag=${branch_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Docker Build Args
+        id: docker-build-args
+        env:
+          DOCKER_PYTHON_BUILDER_IMAGE: ${{ vars.DOCKER_PYTHON_BUILDER_IMAGE }}
+          DOCKER_PYTHON_RUNTIME_IMAGE: ${{ vars.DOCKER_PYTHON_RUNTIME_IMAGE }}
+        run: |
+          builder_image="${DOCKER_PYTHON_BUILDER_IMAGE:-dhi.io/python:3-debian13-sfw-dev}"
+          runtime_image="${DOCKER_PYTHON_RUNTIME_IMAGE:-dhi.io/python:3}"
+          echo "builder_image=${builder_image}" >> "$GITHUB_OUTPUT"
+          echo "runtime_image=${runtime_image}" >> "$GITHUB_OUTPUT"
+
+      # Log into Docker Hub
+      - name: Log in to Docker Hub
+        if: ${{ needs.determine-strategy.outputs.should_push == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Build and conditionally Push the image
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          # Pull Requests will pass 'false', Merges to main/develop will pass 'true'
+          push: ${{ needs.determine-strategy.outputs.should_push }}
+          build-args: |
+            DOCKER_PYTHON_BUILDER_IMAGE=${{ steps.docker-build-args.outputs.builder_image }}
+            DOCKER_PYTHON_RUNTIME_IMAGE=${{ steps.docker-build-args.outputs.runtime_image }}
+          tags: |
+            openfintechlab/paytrace-file-ingest:latest
+            openfintechlab/paytrace-file-ingest:${{ github.sha }}
+            openfintechlab/paytrace-file-ingest:${{ steps.docker-tags.outputs.branch_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
