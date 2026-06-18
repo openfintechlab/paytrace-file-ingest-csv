@@ -110,5 +110,6 @@ jobs:
             openfintechlab/paytrace-file-ingest:latest
             openfintechlab/paytrace-file-ingest:${{ github.sha }}
             openfintechlab/paytrace-file-ingest:${{ steps.docker-tags.outputs.branch_tag }}
+          platforms: linux/amd64,linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
