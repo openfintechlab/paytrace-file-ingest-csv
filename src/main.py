@@ -1,89 +1,72 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
-Copyright 2026-2028 openfintechlab.com, Inc. All rights reserved.
-Licenses: LICENSE.md
-Description: Service Template / starter code for PayTrace SCA Service build on fastapi.
-Reference: https://github.com/openfintechlab/pytrace-backlogs/issues/12
+PayTrace CSV file watcher entrypoint.
 """
 
-from fastapi                import FastAPI
-from routes.Routes          import Routes
-from utilities.Logging      import Logging
-from utilities.ConfigLoader import ConfigLoader 
-from utilities.DBHelper     import DBHelper
-from utilities.HeaderValidationMiddleware import HeaderValidationMiddleware
-from contextlib             import asynccontextmanager
-from uvicorn.config         import LOGGING_CONFIG
+from __future__ import annotations
 
-
-import uvicorn
+import asyncio
 import sys
 
+try:
+    from utilities.ConfigLoader import ConfigLoader
+    from utilities.FileWatcher import FileWatcherAgent
+    from utilities.Logging import Logging
+    from utilities.RabbitMQHelper import RabbitMQConnectionError, RabbitMQHelper, RabbitMQShutdownRequested
+except ModuleNotFoundError:
+    from src.utilities.ConfigLoader import ConfigLoader
+    from src.utilities.FileWatcher import FileWatcherAgent
+    from src.utilities.Logging import Logging
+    from src.utilities.RabbitMQHelper import RabbitMQConnectionError, RabbitMQHelper, RabbitMQShutdownRequested
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    try:        
-        result = DBHelper.initialize_connection()        
-        if not result:
-            Logging.info("Database connection is not established.")
-            Logging.error("Failed to initialize database connection during startup.")
-            raise RuntimeError("Database initialization failed. Service startup aborted.")
-    except Exception as ex:
-        Logging.info("Database connection is not established.")
-        Logging.error(f"Database startup error: {ex}")
-        raise
-    yield
-    DBHelper.dispose_connection()
+_DEFAULT_LOG_LEVEL = "INFO"
+_DEFAULT_ROOT_DIR = "./fwcsv"
 
 
-app         = FastAPI(lifespan=lifespan)
-routes      = Routes()
-app.add_middleware(HeaderValidationMiddleware)
-
-# Initializing the FastAPI app and loading routes from the Routes class.
-app.include_router(routes.router)
-app.include_router(routes.public_router)
-# END;
-
-# Default variables
-_DEFAULT_LOG_FORMAT = "[%(asctime)s] %(levelname)s [%(name)s.%(funcName)s:%(lineno)d] %(message)s"
-_DEFAULT_LOG_LEVEL  = "INFO"
-_DEFAULT_HOST       = "0.0.0.0"
-_DEFAULT_PORT       = 8081
-# END;
-
-
-def displayBanner():
+def display_banner() -> None:
+    banner = r"""
+            ____                   _____       __            __    __          __  
+            / __ \____  ___  ____  / __(_)___  / /____  _____/ /_  / /   ____ _/ /_ 
+            / / / / __ \/ _ \/ __ \/ /_/ / __ \/ __/ _ \/ ___/ __ \/ /   / __ `/ __ \
+            / /_/ / /_/ /  __/ / / / __/ / / / / /_/  __/ /__/ / / / /___/ /_/ / /_/ /
+            \____/ .___/\___/_/ /_/_/ /_/_/ /_/\__/\___/\___/_/ /_/_____/\__,_/_.___/ 
+                /_/                                                                   
+            """
+    print(banner)
     Logging.info("===============================================")
-    Logging.info("Starting PayTrace SCA Service")
-    Logging.info(f"Version: {ConfigLoader.get('OFTL_SCA_VERSION', 'N/A')}")
-    Logging.info(f"Context Root: {ConfigLoader.get('OFTL_SCA_CONTEXT_ROOT', 'N/A')}")
-    Logging.info(f"Host: {ConfigLoader.get('OFTL_SCA_HOST', _DEFAULT_HOST)}")
-    Logging.info(f"Port: {ConfigLoader.get('OFTL_SCA_PORT', _DEFAULT_PORT)}")
-    Logging.info(f"Log Level: {ConfigLoader.get('OFTL_LOG_LEVEL', _DEFAULT_LOG_LEVEL)}")
-    Logging.info(f"Database: {ConfigLoader.get('OFTL_POSTGRESDB_NAME', "N/A")}")
-    Logging.info(f"Database Host: {ConfigLoader.get('OFTL_POSTGRESDB_HOST', "N/A")}")
+    Logging.info("Starting PayTrace File Watcher")
+    Logging.info("Version: %s", ConfigLoader.get("OFTL_SCA_VERSION", "N/A"))
+    Logging.info("Root Dir: %s", ConfigLoader.get("OFTL_FWCSV_ROOTDIR", _DEFAULT_ROOT_DIR))
+    Logging.info("Log Level: %s", ConfigLoader.get("OFTL_LOG_LEVEL", _DEFAULT_LOG_LEVEL))
+    Logging.info("Database: %s", ConfigLoader.get("OFTL_POSTGRESDB_NAME", "N/A"))
+    Logging.info("Database Host: %s", ConfigLoader.get("OFTL_POSTGRESDB_HOST", "N/A"))
     Logging.info("===============================================")
 
-    pass
+
+async def _run() -> None:
+    RabbitMQHelper.initialize_connection()
+    Logging.info("RabbitMQ startup connection established.")
+    agent = FileWatcherAgent()
+    await agent.run_forever()
 
 
 if __name__ == "__main__":
     try:
-        displayBanner()
-        # Setting log cofig and format
-        
-        log_config = LOGGING_CONFIG
-        log_config["formatters"]["default"]["fmt"] = ConfigLoader.get("OFTL_LOG_FORMAT", _DEFAULT_LOG_FORMAT)
-        log_config["handlers"]["default"]["level"] = ConfigLoader.get("OFTL_LOG_LEVEL", _DEFAULT_LOG_LEVEL)
-        # END;
-        uvicorn.run(app, 
-                    host=ConfigLoader.get("OFTL_SCA_HOST", _DEFAULT_HOST),
-                    port=int(ConfigLoader.get("OFTL_SCA_PORT", _DEFAULT_PORT)),
-                    log_config=log_config,
-                )
-        
-    except Exception as e:
-        Logging.error(f"Error starting SCA Service")  
-        Logging.error(str(e))
+        display_banner()
+        Logging.info("Application starting...")
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        Logging.warning("Shutdown requested by user.")
+        sys.exit(0)
+    except RabbitMQShutdownRequested as exc:
+        Logging.error("Error starting file watcher service")
+        Logging.error(str(exc))
+        sys.exit(99)
+    except RabbitMQConnectionError as exc:
+        Logging.error("Error starting file watcher service")
+        Logging.error(str(exc))
+        sys.exit(99)
+    except Exception as exc:
+        Logging.error("Error starting file watcher service")
+        Logging.error(str(exc))
         sys.exit(91)

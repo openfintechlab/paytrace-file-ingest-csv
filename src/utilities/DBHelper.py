@@ -17,8 +17,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
-from utilities.ConfigLoader import ConfigLoader
-from utilities.Logging import Logging
+from .ConfigLoader import ConfigLoader
+from .Logging import Logging
 
 
 class DBHelper:
@@ -29,6 +29,9 @@ class DBHelper:
     _engine: ClassVar[Engine | None] = None
     _session_factory: ClassVar[sessionmaker | None] = None
     _DEFAULT_POOL_SIZE: ClassVar[int] = 10
+    _DEFAULT_DB_NAME: ClassVar[str] = "public"
+    _DEFAULT_DB_SCHEMA: ClassVar[str] = "public"
+    _SQL_CONNECTION_CHECK: ClassVar[str] = "SELECT 1"
 
     def __new__(cls) -> "DBHelper":
         if cls._instance is None:
@@ -42,12 +45,20 @@ class DBHelper:
         return cls()
 
     @classmethod
-    def _build_connection_url(cls) -> str:
+    def _build_connection_url_and_schema(cls) -> tuple[str, str]:
         username    = ConfigLoader.get("OFTL_POSTGRESDB_USERNAME")
         password    = ConfigLoader.get("OFTL_POSTGRESDB_PASSWORD")
         host        = ConfigLoader.get("OFTL_POSTGRESDB_HOST")
         port_value  = ConfigLoader.get("OFTL_POSTGRESDB_PORT")
-        db_name     = ConfigLoader.get("OFTL_POSTGRESDB_NAME")
+        db_name     = ConfigLoader.get("OFTL_POSTGRESDB_NAME", cls._DEFAULT_DB_NAME)
+        db_schema   = ConfigLoader.get("OFTL_POSTGRESDB_SCHEMA", cls._DEFAULT_DB_SCHEMA)
+
+        db_name = str(db_name).strip() if db_name is not None else ""
+        db_schema = str(db_schema).strip() if db_schema is not None else ""
+        if not db_name:
+            db_name = cls._DEFAULT_DB_NAME
+        if not db_schema:
+            db_schema = cls._DEFAULT_DB_SCHEMA
 
         missing = [
             key
@@ -56,7 +67,6 @@ class DBHelper:
                 "OFTL_POSTGRESDB_PASSWORD": password,
                 "OFTL_POSTGRESDB_HOST": host,
                 "OFTL_POSTGRESDB_PORT": port_value,
-                "OFTL_POSTGRESDB_NAME": db_name,
             }.items()
             if not value
         ]
@@ -71,10 +81,11 @@ class DBHelper:
             raise ValueError("Invalid OFTL_POSTGRESDB_PORT; expected a numeric value.")
 
         encoded_password = quote_plus(str(password))
-        return (
+        connection_url = (
             f"postgresql+psycopg2://{username}:{encoded_password}@"
             f"{host}:{port}/{db_name}"
         )
+        return connection_url, db_schema
 
     @classmethod
     def initialize_connection(cls) -> bool:
@@ -87,9 +98,9 @@ class DBHelper:
                 return True
 
             try:
-                connection_url = cls._build_connection_url()
+                connection_url, db_schema = cls._build_connection_url_and_schema()
             except ValueError as exc:
-                Logging.warning(f"Database initialization skipped: {exc}")
+                Logging.warning_context("Database initialization skipped.", error=str(exc))
                 return False
 
             raw_pool_size = ConfigLoader.get(
@@ -103,6 +114,7 @@ class DBHelper:
 
             cls._engine = create_engine(
                 connection_url,
+                connect_args={"options": f"-csearch_path={db_schema}"},
                 pool_size=pool_size,
                 max_overflow=0,
                 pool_pre_ping=True,
@@ -117,11 +129,19 @@ class DBHelper:
 
             try:
                 with cls._engine.connect() as connection:
-                    connection.execute(text("SELECT 1"))
-                Logging.info("Database connection initialized successfully.")
+                    connection.execute(text(cls._SQL_CONNECTION_CHECK))
+                Logging.info_context(
+                    "Database connection initialized successfully.",
+                    schema=db_schema,
+                    pool_size=pool_size,
+                )
                 return True
             except SQLAlchemyError as exc:
-                Logging.error(f"Database connectivity check failed: {exc}")
+                Logging.error_context(
+                    "Database connectivity check failed.",
+                    schema=db_schema,
+                    error=str(exc),
+                )
                 cls.dispose_connection()
                 return False
 
@@ -135,9 +155,14 @@ class DBHelper:
 
     @classmethod
     def _get_session(cls):
-        if cls._session_factory is None and not cls.initialize_connection():
-            raise RuntimeError("Database is not initialized. Check DB configuration.")
-        return cls._session_factory()
+        factory = cls._session_factory
+        if factory is None:
+            if not cls.initialize_connection():
+                raise RuntimeError("Database is not initialized. Check DB configuration.")
+            factory = cls._session_factory
+            if factory is None:
+                raise RuntimeError("Database session factory is unavailable.")
+        return factory()
 
     @classmethod
     def execute_select(
